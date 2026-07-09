@@ -21,12 +21,16 @@ everyone else reconnects to them without touching a thing.
 
 ## Quick start
 
+Nothing to set up first - every fresh install already points at a free, always-on shared
+coordinator, so there's no server to rent or config file to edit before you start.
+
 1. Install [Fabric Loader](https://fabricmc.net/use/) and
    [Fabric API](https://modrinth.com/mod/fabric-api) for Minecraft 1.20.1, then drop the Campfire
    jar into your `mods` folder.
 2. On the title screen, click the **Campfire** flame button (next to the language button).
-3. **One person** clicks *Light a New Campfire*, enters the coordinator's address (see below), and
-   gets an invite like `HYHHAU4STA@example.com:8080` - copy it and send it to your friends.
+3. **One person** clicks *Light a New Campfire* and *Light It* - that's it, no address to type
+   unless you want one (see "Running your own coordinator" below). You'll get an invite like
+   `HYHHAU4STA@campfire-coordinator.example.workers.dev` - copy it and send it to your friends.
 4. **Everyone else** clicks *Join a Campfire* and pastes the invite. That's it - the invite carries
    everything needed, no config editing.
 5. The creator clicks **Create the Shared World** on the Campfire screen, names the world whatever
@@ -47,12 +51,16 @@ Your world is treated as irreplaceable, because it is: every handoff keeps your 
 copy as a backup, save uploads retry through flaky connections, and a bad download can never
 damage the copy you already have.
 
-## The coordinator
+## Running your own coordinator
 
-Your group needs one reachable coordinator - a tiny Node.js server any one of you (or a cheap VPS)
-can run. It uses almost no resources since it never simulates the world; it just does bookkeeping
-and relaying. See [coordinator/coordinator/DEPLOY.md](coordinator/coordinator/DEPLOY.md) for the
-three ways to host it, ranked easiest first.
+The coordinator is just a "phone book" - it never runs Minecraft or simulates the world, it only
+tracks whose turn it is to host and ferries the save + game traffic between you. You don't need to
+run one yourself; every install already uses a free shared coordinator by default. Some groups
+prefer to run their own anyway - more control, no reliance on a server you don't own, useful if
+your group is especially large or active. If that's you, whoever clicks *Light a New Campfire* can
+type a different coordinator address before creating the group, and that address travels with the
+invite to everyone else automatically - nobody else has to configure anything. See
+[coordinator/coordinator/DEPLOY.md](coordinator/coordinator/DEPLOY.md) for self-hosting options.
 
 Anyone who knows your invite can join your world and download its save - treat invites like a
 house key and only share them with your actual friends.
