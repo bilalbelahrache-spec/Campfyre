@@ -38,6 +38,13 @@ and Bob should get a `migrate` message naming him the new host. Run this
 after touching any coordinator logic instead of hand-testing with real game
 clients.
 
+The save file itself transfers over the same WebSocket connection (chunked
+upload/download, falling back to plain HTTP for any coordinator/client that
+doesn't speak it yet) rather than separate HTTP requests - run
+`node test_ws_save_transfer.js` after touching that specific path. It
+uploads a fake multi-part zip, downloads it back on a second connection, and
+checks the bytes match exactly.
+
 ## Running it so friends can actually reach it
 
 See [DEPLOY.md](DEPLOY.md) - VPS (recommended), tunnel service, or home PC

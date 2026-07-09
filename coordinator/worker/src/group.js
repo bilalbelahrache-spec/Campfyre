@@ -81,6 +81,26 @@ export function isValidGroupId(id) {
 }
 const isValidPlayerId = isValidGroupId;
 
+// Base64 helpers for the WebSocket-transport save transfer below. atob/btoa
+// are the standard Web APIs available in the Workers runtime - deliberately
+// not reaching for Node's Buffer, which needs the nodejs_compat flag.
+function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const STEP = 0x8000; // avoid blowing the call stack passing huge arrays to fromCharCode
+  for (let i = 0; i < bytes.length; i += STEP) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + STEP));
+  }
+  return btoa(binary);
+}
+
 export class CampfireGroup {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -320,6 +340,103 @@ export class CampfireGroup {
 
     if (msg.type === 'leaving') {
       await this.handleDeparture(playerId, ws);
+      return;
+    }
+
+    // --- Save transfer over the WebSocket (preferred transport) ---
+    //
+    // Same storage-backed staging/chunk rows as the HTTP chunked-upload path
+    // below (finishUpload/storeChunks are shared), just driven by messages
+    // on the connection every client already has open instead of separate
+    // HTTP requests. Incoming WebSocket messages are billed at a 20:1
+    // discount versus a plain request, and outgoing ones aren't billed at
+    // all - so a whole migration's save transfer costs a small fraction of
+    // what the same bytes cost as chunked HTTP PUT/GET. The HTTP endpoints
+    // stay in place for any coordinator/client version that doesn't speak
+    // this yet (the client gives up waiting for an ack and falls back).
+
+    if (msg.type === 'save_upload_begin') {
+      const uploadId = crypto.randomUUID();
+      await this.ctx.storage.put(`staging:${uploadId}`, { startedMs: Date.now(), chunks: 0, size: 0, partsReceived: 0 });
+      meta.lastUploadActivityMs = Date.now();
+      await this.saveMeta();
+      await this.setAlarmFor('stagingSweep', Date.now() + STAGING_TTL_MS);
+      this.send(ws, { type: 'save_upload_begin_ack', uploadId });
+      return;
+    }
+
+    if (msg.type === 'save_upload_part') {
+      const uploadId = msg.uploadId;
+      const staging = await this.ctx.storage.get(`staging:${uploadId}`);
+      if (!staging) {
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'unknown_upload' });
+        return;
+      }
+      meta.lastUploadActivityMs = Date.now();
+      await this.saveMeta();
+
+      // Parts must arrive in order (the mod sends sequentially, waiting for
+      // each ack before the next). A repeat of the most recent part is an
+      // idempotent retry (its ack got lost); anything else is an error.
+      const expected = staging.partsReceived || 0;
+      if (msg.index === expected - 1) {
+        this.send(ws, { type: 'save_upload_part_ack', uploadId, index: msg.index });
+        return;
+      }
+      if (!Number.isInteger(msg.index) || msg.index !== expected) {
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: `expected_part_${expected}` });
+        return;
+      }
+
+      const buf = base64ToArrayBuffer(msg.data);
+      if (msg.index === 0) {
+        // Never let garbage replace the only copy of a world: every zip starts "PK".
+        const head = new Uint8Array(buf.slice(0, 4));
+        if (head.length < 4 || head[0] !== 0x50 || head[1] !== 0x4b) {
+          this.send(ws, { type: 'save_upload_error', uploadId, reason: 'not_a_zip' });
+          return;
+        }
+      }
+      staging.chunks = await this.storeChunks(uploadId, buf, staging.chunks || 0);
+      staging.size = (staging.size || 0) + buf.byteLength;
+      staging.partsReceived = expected + 1;
+      staging.startedMs = Date.now();
+      await this.ctx.storage.put(`staging:${uploadId}`, staging);
+      this.send(ws, { type: 'save_upload_part_ack', uploadId, index: msg.index });
+      return;
+    }
+
+    if (msg.type === 'save_upload_commit') {
+      const uploadId = msg.uploadId;
+      const staging = await this.ctx.storage.get(`staging:${uploadId}`);
+      if (!staging) {
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'unknown_upload' });
+        return;
+      }
+      await this.ctx.storage.delete(`staging:${uploadId}`);
+      const result = await this.finishUpload(uploadId, staging.chunks, staging.size);
+      const body = await result.json();
+      this.send(ws, { type: 'save_upload_commit_ack', uploadId, saveVersion: body.saveVersion });
+      return;
+    }
+
+    if (msg.type === 'save_download_request') {
+      const save = await this.currentSave();
+      if (!save) {
+        this.send(ws, { type: 'save_download_error', reason: 'no_save' });
+        return;
+      }
+      this.send(ws, { type: 'save_download_begin', totalBytes: save.size, totalParts: save.chunks, saveVersion: meta.saveVersion });
+      for (let i = 0; i < save.chunks; i++) {
+        const chunk = await this.ctx.storage.get(`chunk:${save.id}:${i}`);
+        if (!chunk) {
+          this.send(ws, { type: 'save_download_error', reason: 'missing_chunk' });
+          return;
+        }
+        this.send(ws, { type: 'save_download_part', index: i, data: arrayBufferToBase64(chunk) });
+      }
+      this.send(ws, { type: 'save_download_done' });
+      this.log(`save downloaded over websocket (${(save.size / 1024 / 1024).toFixed(1)} MB, v${meta.saveVersion})`);
       return;
     }
 

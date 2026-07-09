@@ -149,6 +149,11 @@ function getGroup(groupId) {
       uploadsInFlight: 0,
       lastUploadActivityMs: 0,
       emptySince: null,
+      // In-progress WebSocket-transport uploads, keyed by uploadId - see the
+      // 'save_upload_*' handlers below. Never persisted; a dropped
+      // connection mid-transfer just orphans the entry until GC, same as an
+      // abandoned HTTP multipart upload today.
+      activeUploads: new Map(),
     });
   }
   return groups.get(groupId);
@@ -331,7 +336,7 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('ping', () => { ws.isAlive = true; });
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     ws.isAlive = true;
     let msg;
     try {
@@ -431,6 +436,106 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'leaving') {
       handleDeparture(groupId, playerId);
+      return;
+    }
+
+    // --- Save transfer over the WebSocket (preferred transport) ---
+    //
+    // Same destination file, same atomic-write/version-bump/migration-gating
+    // rules as the HTTP endpoints further down - this just rides the
+    // connection every client already has open instead of separate HTTP
+    // requests, so a big world's transfer costs a handful of messages on an
+    // already-open socket instead of dozens of separately billed requests.
+    // The HTTP endpoints stay as the fallback for any coordinator/client
+    // version that doesn't speak this yet (client gives up waiting for
+    // 'save_upload_begin_ack'/'save_download_begin' and falls back itself).
+
+    if (msg.type === 'save_upload_begin') {
+      const uploadId = crypto.randomUUID();
+      group.activeUploads.set(uploadId, { parts: [], startedAt: Date.now() });
+      group.uploadsInFlight += 1;
+      group.lastUploadActivityMs = Date.now();
+      send(ws, { type: 'save_upload_begin_ack', uploadId });
+      return;
+    }
+
+    if (msg.type === 'save_upload_part') {
+      const up = group.activeUploads.get(msg.uploadId);
+      if (!up) {
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'unknown_upload' });
+        return;
+      }
+      group.lastUploadActivityMs = Date.now();
+      // Overwriting the same index again (a retried part) is harmless - the
+      // same bytes just land in the same slot.
+      up.parts[msg.index] = Buffer.from(msg.data, 'base64');
+      send(ws, { type: 'save_upload_part_ack', uploadId: msg.uploadId, index: msg.index });
+      return;
+    }
+
+    if (msg.type === 'save_upload_commit') {
+      const up = group.activeUploads.get(msg.uploadId);
+      if (!up) {
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'unknown_upload' });
+        return;
+      }
+      group.activeUploads.delete(msg.uploadId);
+      group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+      group.lastUploadActivityMs = Date.now();
+
+      if (up.parts.some((p) => !p)) {
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'missing_part' });
+        return;
+      }
+      const buf = Buffer.concat(up.parts);
+      // Same cheap sanity check as the HTTP upload: every zip starts with "PK".
+      if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+        log(`[${groupId}] rejected websocket save upload - not a zip (${buf.length} bytes)`);
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'not_a_zip' });
+        return;
+      }
+
+      restoreFromTrashIfNeeded(groupId);
+      const dest = path.join(SAVES_DIR, `${groupId}.zip`);
+      const tmp = `${dest}.uploading`;
+      try {
+        fs.writeFileSync(tmp, buf);
+        await renameWithRetry(tmp, dest);
+      } catch (e) {
+        log(`[${groupId}] websocket save upload failed - couldn't move the new zip into place: ${e.message}`);
+        try { fs.unlinkSync(tmp); } catch { /* sweep gets it later */ }
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'write_failed' });
+        return;
+      }
+
+      group.saveVersion += 1;
+      broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
+      log(`[${groupId}] save uploaded over websocket (${(buf.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
+      send(ws, { type: 'save_upload_commit_ack', uploadId: msg.uploadId, saveVersion: group.saveVersion });
+
+      if (group.pendingMigration) {
+        resolvePendingMigration(groupId);
+      }
+      return;
+    }
+
+    if (msg.type === 'save_download_request') {
+      restoreFromTrashIfNeeded(groupId);
+      const filePath = path.join(SAVES_DIR, `${groupId}.zip`);
+      if (!fs.existsSync(filePath)) {
+        send(ws, { type: 'save_download_error', reason: 'no_save' });
+        return;
+      }
+      const buf = fs.readFileSync(filePath);
+      const totalParts = Math.max(1, Math.ceil(buf.length / WS_TRANSFER_PART_BYTES));
+      send(ws, { type: 'save_download_begin', totalBytes: buf.length, totalParts, saveVersion: group.saveVersion });
+      for (let i = 0; i < totalParts; i++) {
+        const off = i * WS_TRANSFER_PART_BYTES;
+        const part = buf.subarray(off, Math.min(off + WS_TRANSFER_PART_BYTES, buf.length));
+        send(ws, { type: 'save_download_part', index: i, data: part.toString('base64') });
+      }
+      send(ws, { type: 'save_download_done' });
+      log(`[${groupId}] save downloaded over websocket (${(buf.length / 1024 / 1024).toFixed(1)} MB, v${group.saveVersion})`);
       return;
     }
 
@@ -550,6 +655,12 @@ function handleDeparture(groupId, playerId) {
 // --- Save file relay (plain HTTP, separate from the WebSocket signaling) ---
 
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2GB cap for now
+
+// Chunk size for the WebSocket-transport save transfer above. Comfortably
+// under Workers' 32MB-per-message WebSocket limit even after base64's ~33%
+// inflation, and small enough to keep per-message memory pressure low on a
+// player's JVM heap.
+const WS_TRANSFER_PART_BYTES = 512 * 1024;
 
 // If a group's save was archived to trash for inactivity and someone just
 // reconnected/uploaded/downloaded, that's proof the group isn't abandoned

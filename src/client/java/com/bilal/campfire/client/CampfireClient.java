@@ -46,10 +46,12 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.Deflater;
@@ -192,6 +194,15 @@ public class CampfireClient implements ClientModInitializer {
     // caller, not just relay.
     private final ConcurrentLinkedQueue<String> sendQueue = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean sendInFlight = new AtomicBoolean(false);
+
+    // Inbox for the WebSocket-transport save transfer (see
+    // uploadSaveViaWebSocket/downloadSaveViaWebSocket): a transfer in
+    // progress waits on this synchronously from its own background thread,
+    // since it's a real request/response conversation (begin -> parts ->
+    // commit), not fire-and-forget. Cleared at the start of every new
+    // attempt so a stray late message from an abandoned/timed-out previous
+    // attempt can't be mistaken for part of the current one.
+    private final BlockingQueue<JsonObject> saveTransferInbox = new LinkedBlockingQueue<>();
 
     private volatile String currentHostId;
 
@@ -1902,6 +1913,9 @@ public class CampfireClient implements ClientModInitializer {
             return false;
         }
 
+        if (uploadSaveViaWebSocket(zipBytes)) return true;
+        System.out.println("[Campfire] Websocket save upload didn't complete - falling back to HTTP.");
+
         if (zipBytes.length > CHUNKED_UPLOAD_THRESHOLD_BYTES) {
             Boolean chunked = uploadSaveChunked(zipBytes);
             if (chunked != null) return chunked;
@@ -2048,6 +2062,128 @@ public class CampfireClient implements ClientModInitializer {
         return null;
     }
 
+    // ---------- Save transfer over the coordinator WebSocket (preferred) ----------
+    //
+    // Same destination/extraction logic as the HTTP paths above - this just
+    // rides the persistent connection every client already has open instead
+    // of separate HTTP requests, so a whole migration's transfer costs a
+    // handful of messages on an already-open socket instead of dozens of
+    // separately billed HTTP requests (and sidesteps the community
+    // coordinator's proxy body-size cap entirely, since there's no single
+    // request body to cap). Both methods return a definitive "didn't work"
+    // value (false / null) for ANY reason - coordinator doesn't speak this
+    // protocol yet, a real error, a timeout - so the caller always has one
+    // answer: fall back to the proven HTTP path, unchanged.
+
+    private static final long SAVE_TRANSFER_ACK_TIMEOUT_MS = 10_000;
+    private static final int WS_TRANSFER_PART_BYTES = 512 * 1024;
+
+    // Blocks (off the websocket thread - callers are always the upload/
+    // download background thread) until a message of successType or
+    // errorType lands in saveTransferInbox, or the timeout passes with
+    // nothing at all - which is exactly what happens talking to a
+    // coordinator that doesn't know this protocol, since an unrecognized
+    // message type is silently ignored server-side. Returns null on timeout
+    // or an explicit error.
+    private JsonObject awaitSaveTransferMessage(String successType, String errorType) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + SAVE_TRANSFER_ACK_TIMEOUT_MS;
+        while (true) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) return null;
+            JsonObject msg = saveTransferInbox.poll(remaining, TimeUnit.MILLISECONDS);
+            if (msg == null) return null;
+            String type = msg.has("type") ? msg.get("type").getAsString() : null;
+            if (successType.equals(type)) return msg;
+            if (errorType.equals(type)) {
+                System.out.println("[Campfire] Save transfer error over websocket: " + msg);
+                return null;
+            }
+            // Anything else is a stray leftover - keep waiting for the real answer.
+        }
+    }
+
+    private boolean uploadSaveViaWebSocket(byte[] zipBytes) {
+        if (webSocket == null) return false;
+        saveTransferInbox.clear();
+        try {
+            JsonObject begin = new JsonObject();
+            begin.addProperty("type", "save_upload_begin");
+            sendJson(begin);
+            JsonObject beginAck = awaitSaveTransferMessage("save_upload_begin_ack", "save_upload_error");
+            if (beginAck == null) return false;
+            String uploadId = beginAck.get("uploadId").getAsString();
+
+            int parts = Math.max(1, (zipBytes.length + WS_TRANSFER_PART_BYTES - 1) / WS_TRANSFER_PART_BYTES);
+            for (int i = 0; i < parts; i++) {
+                int off = i * WS_TRANSFER_PART_BYTES;
+                byte[] part = java.util.Arrays.copyOfRange(zipBytes, off, Math.min(off + WS_TRANSFER_PART_BYTES, zipBytes.length));
+                JsonObject partMsg = new JsonObject();
+                partMsg.addProperty("type", "save_upload_part");
+                partMsg.addProperty("uploadId", uploadId);
+                partMsg.addProperty("index", i);
+                partMsg.addProperty("data", Base64.getEncoder().encodeToString(part));
+                sendJson(partMsg);
+                JsonObject ack = awaitSaveTransferMessage("save_upload_part_ack", "save_upload_error");
+                if (ack == null) return false;
+                System.out.println("[Campfire] Uploaded save part " + (i + 1) + "/" + parts + " over websocket");
+            }
+
+            JsonObject commit = new JsonObject();
+            commit.addProperty("type", "save_upload_commit");
+            commit.addProperty("uploadId", uploadId);
+            sendJson(commit);
+            JsonObject commitAck = awaitSaveTransferMessage("save_upload_commit_ack", "save_upload_error");
+            if (commitAck == null) return false;
+
+            recordUploadedSaveVersion(commitAck.toString());
+            System.out.println("[Campfire] Save uploaded over websocket -> v" + knownSaveVersion);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private byte[] downloadSaveViaWebSocket(String groupId) {
+        if (webSocket == null) return null;
+        saveTransferInbox.clear();
+        try {
+            JsonObject request = new JsonObject();
+            request.addProperty("type", "save_download_request");
+            sendJson(request);
+
+            JsonObject begin = awaitSaveTransferMessage("save_download_begin", "save_download_error");
+            if (begin == null) return null;
+            int totalParts = begin.get("totalParts").getAsInt();
+            int totalBytes = begin.get("totalBytes").getAsInt();
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(totalBytes, 0));
+            for (int i = 0; i < totalParts; i++) {
+                JsonObject part = awaitSaveTransferMessage("save_download_part", "save_download_error");
+                if (part == null) return null;
+                out.write(Base64.getDecoder().decode(part.get("data").getAsString()));
+            }
+            JsonObject done = awaitSaveTransferMessage("save_download_done", "save_download_error");
+            if (done == null) return null;
+
+            byte[] result = out.toByteArray();
+            if (result.length != totalBytes) {
+                System.out.println("[Campfire] Websocket download size mismatch (" + result.length + " != " + totalBytes + ") - falling back to HTTP.");
+                return null;
+            }
+            System.out.println("[Campfire] Save downloaded over websocket (" + (result.length / 1024 / 1024) + " MB)");
+            return result;
+        } catch (IOException e) {
+            // Never actually thrown by ByteArrayOutputStream in practice, but
+            // its write() signature declares it.
+            System.out.println("[Campfire] Websocket download failed: " + e.getMessage());
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
     // The coordinator's upload response echoes the version our upload just
     // became. Recording it means our local copy is provably the latest -
     // next "Open the World" skips the download.
@@ -2173,41 +2309,44 @@ public class CampfireClient implements ClientModInitializer {
             return true;
         }
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save"))
-                    // Same reasoning as the upload's timeout - this is exactly
-                    // the request that sat hung with no error for minutes,
-                    // stuck on a disabled "Getting the world ready..." button,
-                    // when a network hiccup left the connection open but silent.
-                    .timeout(Duration.ofMinutes(5))
-                    .GET()
-                    .build();
+            byte[] zipBytes = downloadSaveViaWebSocket(groupId);
+            if (zipBytes == null) {
+                System.out.println("[Campfire] Websocket save download didn't complete - falling back to HTTP.");
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save"))
+                        // Same reasoning as the upload's timeout - this is exactly
+                        // the request that sat hung with no error for minutes,
+                        // stuck on a disabled "Getting the world ready..." button,
+                        // when a network hiccup left the connection open but silent.
+                        .timeout(Duration.ofMinutes(5))
+                        .GET()
+                        .build();
 
-            // Same retry discipline as the upload, for the same reason: a
-            // failed download here means the incoming host opens a stale
-            // world (or nothing at all). Fresh client per attempt so a stale
-            // pooled connection can't fail every attempt identically.
-            byte[] zipBytes = null;
-            for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
-                try {
-                    HttpResponse<byte[]> response = newTransferClient().send(request, HttpResponse.BodyHandlers.ofByteArray());
-                    System.out.println("[Campfire] Download response: " + response.statusCode()
-                            + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
-                    if (response.statusCode() == 200) {
-                        zipBytes = response.body();
-                        break;
-                    } else if (response.statusCode() == 404) {
-                        System.out.println("[Campfire] No save uploaded yet for group " + groupId);
-                        return true; // first-ever host of a brand new group - nothing to download yet, not a failure
-                    } else if (response.statusCode() >= 400 && response.statusCode() < 500) {
-                        return false; // our request is wrong - retrying won't heal it
+                // Same retry discipline as the upload, for the same reason: a
+                // failed download here means the incoming host opens a stale
+                // world (or nothing at all). Fresh client per attempt so a stale
+                // pooled connection can't fail every attempt identically.
+                for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+                    try {
+                        HttpResponse<byte[]> response = newTransferClient().send(request, HttpResponse.BodyHandlers.ofByteArray());
+                        System.out.println("[Campfire] Download response: " + response.statusCode()
+                                + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
+                        if (response.statusCode() == 200) {
+                            zipBytes = response.body();
+                            break;
+                        } else if (response.statusCode() == 404) {
+                            System.out.println("[Campfire] No save uploaded yet for group " + groupId);
+                            return true; // first-ever host of a brand new group - nothing to download yet, not a failure
+                        } else if (response.statusCode() >= 400 && response.statusCode() < 500) {
+                            return false; // our request is wrong - retrying won't heal it
+                        }
+                    } catch (IOException e) {
+                        System.out.println("[Campfire] Download attempt " + attempt + "/" + UPLOAD_ATTEMPTS + " failed: " + e.getMessage());
                     }
-                } catch (IOException e) {
-                    System.out.println("[Campfire] Download attempt " + attempt + "/" + UPLOAD_ATTEMPTS + " failed: " + e.getMessage());
+                    if (attempt < UPLOAD_ATTEMPTS) Thread.sleep(UPLOAD_RETRY_DELAY_MS);
                 }
-                if (attempt < UPLOAD_ATTEMPTS) Thread.sleep(UPLOAD_RETRY_DELAY_MS);
+                if (zipBytes == null) return false;
             }
-            if (zipBytes == null) return false;
 
             {
                 Path gameDir = FabricLoader.getInstance().getGameDir();
@@ -2761,6 +2900,15 @@ public class CampfireClient implements ClientModInitializer {
                             MinecraftClient.getInstance().execute(() -> MinecraftClient.getInstance().setScreen(new TitleScreen()));
                         }, "campfire-close-fork").start();
                     }
+                }
+                case "save_upload_begin_ack", "save_upload_part_ack", "save_upload_commit_ack", "save_upload_error",
+                        "save_download_begin", "save_download_part", "save_download_done", "save_download_error" -> {
+                    // A save transfer in progress is waiting on exactly this,
+                    // synchronously, from its own thread - see
+                    // awaitSaveTransferMessage. Never handled inline here:
+                    // uploadSaveViaWebSocket/downloadSaveViaWebSocket own the
+                    // whole conversation once they send the first message.
+                    saveTransferInbox.offer(json);
                 }
                 default -> {
                     // save_ready: not yet used by the mod
