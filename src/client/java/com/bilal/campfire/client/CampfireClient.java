@@ -1690,8 +1690,9 @@ public class CampfireClient implements ClientModInitializer {
     }
 
     // Second-tier fallback, tried only once UPnP has already been ruled out
-    // (no host_direct_address arrived in time). Reflects our own address off
-    // the coordinator's reflector, hands it to the host via punch_candidate,
+    // (no host_direct_address arrived in time). Reflects our own address
+    // (coordinator first, public STUN servers as fallback - see
+    // HolePuncher.reflect()), hands it to the host via punch_candidate,
     // waits for the host's own reflected address in return, then races
     // repeated connect() attempts against it (HolePuncher.punch) - the
     // standard TCP "simultaneous open" hole-punch technique. This only works
@@ -1704,7 +1705,7 @@ public class CampfireClient implements ClientModInitializer {
         new Thread(() -> {
             HolePuncher.ReflectedAddress own = HolePuncher.reflect(coordinatorBareHost, coordinatorPort, PUNCH_LOCAL_PORT);
             if (own == null) {
-                System.out.println("[Campfire] Hole-punch unavailable (couldn't reach the coordinator's reflector) - using the relay instead.");
+                System.out.println("[Campfire] Hole-punch unavailable (couldn't reflect our address via the coordinator or public STUN) - using the relay instead.");
                 reconnectThroughRelay();
                 return;
             }
