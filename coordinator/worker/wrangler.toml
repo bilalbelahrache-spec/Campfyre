@@ -1,0 +1,24 @@
+name = "campfire-coordinator"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# One Durable Object per friend group. Each group is its own isolated,
+# single-threaded little server with its own storage - which is exactly the
+# consistency model the Node coordinator got from a single process holding a
+# `groups` Map, except it scales horizontally for free because unrelated
+# groups never share anything.
+[[durable_objects.bindings]]
+name = "GROUPS"
+class_name = "CampfireGroup"
+
+# Tiny per-IP rate limiter for the one unauthenticated endpoint a script
+# could hammer (POST /groups/new).
+[[durable_objects.bindings]]
+name = "LIMITER"
+class_name = "MintLimiter"
+
+# SQLite-backed storage is what's available on the free plan (and what the
+# save-chunk storage assumes).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CampfireGroup", "MintLimiter"]
