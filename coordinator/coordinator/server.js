@@ -21,7 +21,6 @@ const multer = require('multer');
 const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
-const githubBackup = require('./githubBackup');
 
 const PORT = process.env.PORT || 8080;
 const SAVES_DIR = path.join(__dirname, 'saves');
@@ -644,10 +643,6 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
   group.saveVersion += 1;
   broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
   log(`[${groupId}] save uploaded (${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
-  // Best-effort, doesn't block the response the mod is waiting on - see
-  // githubBackup.js for why this exists (free sleep-tier hosts wipe local
-  // disk on every spin-down/spin-up).
-  githubBackup.backupSaveToGithub(groupId, buf);
 
   // If a host departure is waiting on exactly this upload, this is the
   // signal it's been waiting for - migrate now, with the version we just set.
@@ -842,17 +837,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
-log(githubBackup.enabled
-  ? `GitHub save backup: enabled (${process.env.GITHUB_REPO})`
-  : 'GitHub save backup: disabled (set GITHUB_TOKEN + GITHUB_REPO to survive a sleep-tier host restart)');
-
-// Restoring any previously-backed-up saves has to finish BEFORE the server
-// starts accepting requests - group.saveVersion gets seeded from whether a
-// local zip exists the moment a client first says 'hello', and that must
-// never race a still-in-progress restore.
-(async () => {
-  await githubBackup.restoreAllSaves(SAVES_DIR);
-  server.listen(PORT, () => log(`coordinator listening on :${PORT}`));
-})();
+server.listen(PORT, () => log(`coordinator listening on :${PORT}`));
 
 module.exports = { app, server, groups };

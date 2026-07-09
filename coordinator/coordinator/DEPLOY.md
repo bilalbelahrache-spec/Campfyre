@@ -25,82 +25,11 @@ never who's the coordinator. So the right way to think about the options below i
 pick per-session" - it's "one person in the group sets this up ONE time, on something that stays up,
 and everyone forgets about it."
 
-## Self-hosting with Render: free, no credit card, no home PC required
-
-Two things had to both be true and turned out to be in tension: genuinely free-forever compute
-without a card on file (Oracle/Fly/GCP/AWS/Azure all require one now, specifically to stop free-tier
-abuse), *and* a save file that survives indefinitely (the no-card-required free hosts achieve that by
-sleeping after ~15 min of inactivity and wiping local disk on every sleep/wake cycle). The fix is to
-stop asking one host to do both jobs:
-
-- **[Render](https://render.com)'s free web service tier** for the always-on bookkeeping (who's
-  online, whose turn to host). No card needed to deploy. It sleeps after 15 min idle and wipes local
-  disk on wake - but the coordinator's in-memory group/queue state is *already* designed to be
-  disposable on restart; reconnecting clients rebuild it automatically. The only thing that can never
-  be allowed to just vanish is the save file itself, so:
-- **GitHub Releases in this same repo** (which you already have, so this needs no new account or
-  card) back up the save .zip after every upload, and restore it automatically the moment the
-  coordinator wakes up - before it answers any request. See `githubBackup.js` for how; it's a
-  no-op unless the two env vars below are set, so it can't affect local dev.
-
-### Setup (~10 minutes, no card anywhere)
-
-1. **Create a GitHub token**: on github.com, Settings → Developer settings → Personal access tokens
-   → Fine-grained tokens → Generate new token. Scope it to just this repository, with **Contents:
-   Read and write** permission (that's what covers Releases). Copy the token - you won't see it
-   again.
-2. **Deploy to Render**: on render.com, New → Web Service → connect this GitHub repo, root directory
-   `coordinator/coordinator`. Render auto-detects Node; set:
-   - Build command: `npm install`
-   - Start command: `node server.js`
-   - Plan: **Free**
-3. **Add environment variables** on the Render service (Environment tab):
-   - `GITHUB_TOKEN` = the token from step 1
-   - `GITHUB_REPO` = `bilalbelahrache-spec/host-migration`
-4. Deploy. Render gives you a URL like `https://coordinator-campfire.onrender.com` - that IS the
-   coordinator address, already on `https://` (port 443, no separate port to forward or remember).
-5. Verify from a *different* network: `https://<your-app>.onrender.com/health` should show
-   `{"ok":true,...}`.
-6. In-game, type the **full address including `https://`** into the "Light a New Campfire"
-   coordinator field (the mod already understands `https://`/`wss://` - see `CampfireClient.java`).
-   The invite code carries it to everyone else automatically.
-
-### What to actually expect
-
-- **The first connection after a quiet spell takes ~30-60s** while Render wakes the service back up
-  and it restores the last save from GitHub - the mod's existing auto-reconnect (retries every 5s)
-  handles this without you doing anything; it just looks like a slightly slow first connect, not a
-  failure.
-- **Known gap, low stakes**: the existing 180-day-inactive → trash → 90-day purge archival lifecycle
-  still only operates on Render's local disk, so an *archived* save wouldn't survive
-  a sleep/wake cycle the same way a live one does. This only matters if a group goes silent for
-  6+ months, at which point re-running an upload/download restores it from GitHub again anyway (the
-  live-save path above always wins first). Not worth the extra complexity to close for a friend group
-  that's actively playing.
-
-### Alternative: a VPS or your own always-on machine
-
-If you'd rather not deal with any of the above - a cheap always-on VPS (DigitalOcean/Hetzner/Linode,
-~$4-6/month) or a spare machine that's already on 24/7 sidesteps the whole sleep/persistence problem,
-using the plain Docker/systemd setup below.
-
-```bash
-# on the VPS
-git clone <this repo> && cd coordinator/coordinator
-sudo docker compose up -d
-```
-`restart: unless-stopped` in `docker-compose.yml` means it survives a crash; enabling Docker's own
-systemd service (on by default on most distros) means it survives a reboot too. Saves live in
-`./saves` next to `docker-compose.yml`, mounted into the container so they persist across rebuilds.
-
-Don't want Docker? `deploy/coordinator.service` is a ready-to-copy systemd unit
-(`sudo cp deploy/coordinator.service /etc/systemd/system/ && sudo systemctl enable --now
-coordinator`) - adjust `WorkingDirectory` and create the `campfire` user (or swap in your own) first.
-
 ## Option 1 - a small VPS (any provider, manual)
 
-Any cheap cloud VM (Hetzner, Oracle Free Tier, DigitalOcean, etc.) works and is the only option
-with zero home-network headaches, since VPSes have real public IPs.
+Any cheap cloud VM (Hetzner, Oracle Free Tier, DigitalOcean, etc., ~$4-6/month) works and is the
+option with the fewest failure modes, since VPSes have real public IPs and don't sleep or wipe disk
+between requests the way card-free serverless free tiers do.
 
 ```bash
 # on the VPS
@@ -114,9 +43,18 @@ PORT=8080 node server.js
   (`npm i -g pm2 && pm2 start server.js && pm2 save && pm2 startup`).
 - Verify from any other network: `http://<vps-ip>:8080/health` in a browser should show
   `{"ok":true,...}`.
+- Prefer Docker or a managed unit over a bare foreground process: `sudo docker compose up -d`
+  (`restart: unless-stopped` in `docker-compose.yml` survives a crash; Docker's own systemd
+  integration, on by default on most distros, survives a reboot too), or copy the ready-made
+  `deploy/coordinator.service` systemd unit (`sudo cp deploy/coordinator.service
+  /etc/systemd/system/ && sudo systemctl enable --now coordinator` - adjust `WorkingDirectory` and
+  create the `campfire` user first).
 
-**What about the saves?** They live in `saves/` next to `server.js`. That directory is the only
-copy of your group's world when nobody's playing - back it up like you would any world folder.
+**What about the saves?** They live in `saves/` next to `server.js` (or in the mounted `./saves`
+volume with Docker). That directory is the only copy of your group's world when nobody's playing -
+back it up like you would any world folder. Because a VPS or systemd-managed process doesn't sleep
+or wipe its disk, there's no need for the GitHub-Releases backup trick this doc used to describe for
+card-free serverless free tiers - that persistence problem doesn't exist here.
 
 ## Option 2 - a tunnel service from a home PC (no router setup)
 
