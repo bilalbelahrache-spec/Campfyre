@@ -90,10 +90,10 @@ public class CampfireCreateScreen extends Screen {
         CampfireUi.drawTitle(context, this.textRenderer, this.title, centerX, panelTop + 10);
         CampfireUi.drawDivider(context, centerX, panelTop + 23, 280);
         CampfireUi.drawCenteredWrapped(context, this.textRenderer,
-                "Your group needs one coordinator - a tiny server.",
+                "Ready to go - no setup needed, just light it.",
                 centerX, panelTop + 32, 300, CampfireUi.TEXT_COLOR);
         CampfireUi.drawCenteredWrapped(context, this.textRenderer,
-                "Enter it once - your invite carries it to friends.",
+                "Running your own coordinator? Change it below.",
                 centerX, panelTop + 44, 300, CampfireUi.MUTED_TEXT);
         context.drawTextWithShadow(this.textRenderer,
                 Text.literal("Coordinator address:"),

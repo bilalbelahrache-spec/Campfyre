@@ -743,14 +743,14 @@ public class CampfireClient implements ClientModInitializer {
                 // created several campfires recently, nothing to do with the
                 // coordinator address typed into the field above it.
                 System.out.println("[Campfire] Coordinator rate-limited this address (HTTP 429): " + response.body());
-                return MintOutcome.failed("You've created several campfires from here recently - wait a bit and try again.");
+                return MintOutcome.failed("You've made several campfires recently - wait a bit.");
             }
             if (response.statusCode() >= 500) {
                 // The shared default coordinator (or anyone's self-hosted
                 // one) having trouble - a real player has no way to fix
                 // this by editing the address field, so don't tell them to.
                 System.out.println("[Campfire] Coordinator is having trouble (HTTP " + response.statusCode() + "): " + response.body());
-                return MintOutcome.failed("The coordinator is busy or having trouble right now - try again shortly.");
+                return MintOutcome.failed("The coordinator's busy right now - try again shortly.");
             }
             if (response.statusCode() != 200) {
                 System.out.println("[Campfire] Failed to create a new group (HTTP " + response.statusCode() + ")");
@@ -766,6 +766,18 @@ public class CampfireClient implements ClientModInitializer {
         } catch (IOException | InterruptedException e) {
             System.out.println("[Campfire] Failed to create a new group (is the coordinator reachable?): " + e.getMessage());
             return MintOutcome.failed("Couldn't reach the coordinator - check the address.");
+        } catch (RuntimeException e) {
+            // A 200 whose body isn't the JSON shape we expect - a coordinator
+            // under real strain (quota trouble, a proxy error page slipped
+            // through with a 200) can do this. Without this catch the
+            // JsonSyntaxException/IllegalStateException here would escape
+            // uncaught out of the "campfire-mint" thread entirely, and
+            // CampfireCreateScreen's callback (which resets the disabled
+            // button and "Asking the coordinator..." text) would just never
+            // run - the player would be stuck looking at a dead button
+            // forever with no error at all.
+            System.out.println("[Campfire] Coordinator sent back something unexpected: " + e.getMessage());
+            return MintOutcome.failed("Got an odd reply from the coordinator - try again.");
         }
     }
 
