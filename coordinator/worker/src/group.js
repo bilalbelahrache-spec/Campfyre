@@ -50,6 +50,14 @@ const PURGE_AFTER_EMPTY_MS = 270 * 24 * 60 * 60 * 1000;
 // abandoned - sweep its staged chunks.
 const STAGING_TTL_MS = 60 * 60 * 1000;
 
+// Same 2GB backstop on both the legacy chunked-HTTP upload and the newer
+// WebSocket upload - neither had one, which meant a client could stream
+// parts into Durable Object storage forever. This is not a real-world-size
+// limit (no legitimate Minecraft save gets remotely close); it exists only
+// to bound a runaway or malicious upload. Checked incrementally per-part so
+// a bad actor is cut off early instead of after fully persisting gigabytes.
+const UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
 // Storage values cap at 2MB on the SQLite backend; store save zips as rows
 // of this size.
 const CHUNK_SIZE = 2 * 1024 * 1024;
@@ -356,6 +364,16 @@ export class CampfireGroup {
     // this yet (the client gives up waiting for an ack and falls back).
 
     if (msg.type === 'save_upload_begin') {
+      // Cap concurrent uploads per group at 1 (a Durable Object only ever
+      // holds one group's staging rows, so any existing one is this
+      // group's) - a legitimate migration never needs two in flight, and
+      // without this a client could open unlimited uploadIds and stage
+      // unbounded storage.
+      const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
+      if (existing.size > 0) {
+        this.send(ws, { type: 'save_upload_error', reason: 'upload_already_in_progress' });
+        return;
+      }
       const uploadId = crypto.randomUUID();
       await this.ctx.storage.put(`staging:${uploadId}`, { startedMs: Date.now(), chunks: 0, size: 0, partsReceived: 0 });
       meta.lastUploadActivityMs = Date.now();
@@ -396,6 +414,15 @@ export class CampfireGroup {
           this.send(ws, { type: 'save_upload_error', uploadId, reason: 'not_a_zip' });
           return;
         }
+      }
+      if ((staging.size || 0) + buf.byteLength > UPLOAD_MAX_BYTES) {
+        for (let i = 0; i < (staging.chunks || 0); i++) {
+          await this.ctx.storage.delete(`chunk:${uploadId}:${i}`);
+        }
+        await this.ctx.storage.delete(`staging:${uploadId}`);
+        this.log(`rejected websocket save upload - exceeded ${UPLOAD_MAX_BYTES / 1024 / 1024 / 1024}GB cap`);
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'too_large' });
+        return;
       }
       staging.chunks = await this.storeChunks(uploadId, buf, staging.chunks || 0);
       staging.size = (staging.size || 0) + buf.byteLength;
@@ -703,6 +730,11 @@ export class CampfireGroup {
   // served from, so commit is just validation + the atomic pointer flip.
   async handleUploadBegin() {
     const meta = await this.loaded();
+    // Same concurrent-upload cap as the WebSocket path - see save_upload_begin.
+    const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
+    if (existing.size > 0) {
+      return Response.json({ error: 'upload already in progress' }, { status: 409 });
+    }
     const uploadId = crypto.randomUUID();
     await this.ctx.storage.put(`staging:${uploadId}`, { startedMs: Date.now(), chunks: 0, size: 0 });
     meta.lastUploadActivityMs = Date.now();
@@ -739,6 +771,14 @@ export class CampfireGroup {
       if (head.length < 4 || head[0] !== 0x50 || head[1] !== 0x4b) {
         return Response.json({ error: 'not a zip' }, { status: 400 });
       }
+    }
+    if ((staging.size || 0) + buf.byteLength > UPLOAD_MAX_BYTES) {
+      for (let i = 0; i < (staging.chunks || 0); i++) {
+        await this.ctx.storage.delete(`chunk:${uploadId}:${i}`);
+      }
+      await this.ctx.storage.delete(`staging:${uploadId}`);
+      this.log(`rejected chunked save upload - exceeded ${UPLOAD_MAX_BYTES / 1024 / 1024 / 1024}GB cap`);
+      return Response.json({ error: 'too large' }, { status: 413 });
     }
     staging.chunks = await this.storeChunks(uploadId, buf, staging.chunks || 0);
     staging.size = (staging.size || 0) + buf.byteLength;

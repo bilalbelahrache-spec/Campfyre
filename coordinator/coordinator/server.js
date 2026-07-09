@@ -451,8 +451,15 @@ wss.on('connection', (ws) => {
     // 'save_upload_begin_ack'/'save_download_begin' and falls back itself).
 
     if (msg.type === 'save_upload_begin') {
+      // Cap concurrent uploads per group at 1 - nothing about a legitimate
+      // migration ever needs two in flight at once, and without this a
+      // client could open unlimited uploadIds and stage unbounded buffers.
+      if (group.activeUploads.size > 0) {
+        send(ws, { type: 'save_upload_error', reason: 'upload_already_in_progress' });
+        return;
+      }
       const uploadId = crypto.randomUUID();
-      group.activeUploads.set(uploadId, { parts: [], startedAt: Date.now() });
+      group.activeUploads.set(uploadId, { parts: [], size: 0, startedAt: Date.now() });
       group.uploadsInFlight += 1;
       group.lastUploadActivityMs = Date.now();
       send(ws, { type: 'save_upload_begin_ack', uploadId });
@@ -468,7 +475,17 @@ wss.on('connection', (ws) => {
       group.lastUploadActivityMs = Date.now();
       // Overwriting the same index again (a retried part) is harmless - the
       // same bytes just land in the same slot.
-      up.parts[msg.index] = Buffer.from(msg.data, 'base64');
+      const buf = Buffer.from(msg.data, 'base64');
+      const previous = up.parts[msg.index];
+      up.size += buf.length - (previous ? previous.length : 0);
+      if (up.size > WS_UPLOAD_MAX_BYTES) {
+        group.activeUploads.delete(msg.uploadId);
+        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+        log(`[${groupId}] rejected websocket save upload - exceeded ${WS_UPLOAD_MAX_BYTES / 1024 / 1024 / 1024}GB cap`);
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'too_large' });
+        return;
+      }
+      up.parts[msg.index] = buf;
       send(ws, { type: 'save_upload_part_ack', uploadId: msg.uploadId, index: msg.index });
       return;
     }
@@ -661,6 +678,20 @@ const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2GB 
 // inflation, and small enough to keep per-message memory pressure low on a
 // player's JVM heap.
 const WS_TRANSFER_PART_BYTES = 512 * 1024;
+
+// Same 2GB backstop as the HTTP multer upload above, applied to the
+// WebSocket path too - it never had one, which meant a client could stream
+// parts forever with nothing to stop it. This is not a real-world-size
+// limit (no legitimate Minecraft save gets remotely close); it exists only
+// to bound a runaway or malicious upload. Checked incrementally per-part so
+// a bad actor is cut off early instead of after fully buffering gigabytes.
+const WS_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+// An abandoned WebSocket upload (connection dropped mid-transfer) has
+// nothing else to reap it - unlike the HTTP path's temp file, it lives only
+// in this Map, so without a sweep it stays allocated forever. Real uploads
+// finish in seconds; anything older than this is orphaned.
+const WS_UPLOAD_ABANDON_MS = 10 * 60 * 1000;
 
 // If a group's save was archived to trash for inactivity and someone just
 // reconnected/uploaded/downloaded, that's proof the group isn't abandoned
@@ -930,11 +961,28 @@ function pruneMintHistory() {
   }
 }
 
+// A WebSocket upload whose connection dropped mid-transfer has no temp file
+// to sweep (unlike the HTTP path) - it only lives in group.activeUploads,
+// so without this it stays allocated in memory forever.
+function pruneAbandonedUploads() {
+  const now = Date.now();
+  for (const [groupId, group] of groups) {
+    for (const [uploadId, up] of group.activeUploads) {
+      if (now - up.startedAt > WS_UPLOAD_ABANDON_MS) {
+        group.activeUploads.delete(uploadId);
+        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+        log(`[${groupId}] swept abandoned websocket upload ${uploadId}`);
+      }
+    }
+  }
+}
+
 setInterval(() => {
   archiveStaleGroups();
   purgeOldTrash();
   cleanOrphanedUploadTemps();
   pruneMintHistory();
+  pruneAbandonedUploads();
 }, CLEANUP_INTERVAL_MS);
 
 // Express's default error handler answers with a full HTML error page,
