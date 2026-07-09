@@ -79,7 +79,7 @@ public class CampfireClient implements ClientModInitializer {
     // player repoints it (self-hosted instance, or an invite carrying a
     // different address). Ships hardcoded rather than as a build property so
     // a plain downloaded jar always has a working default with zero setup.
-    private static final String DEFAULT_COORDINATOR_HOST = "https://campfire-coordinator.onrender.com";
+    private static final String DEFAULT_COORDINATOR_HOST = "https://campfire-coordinator.bilal-belahrache.workers.dev";
 
     private static final int RELAY_LISTEN_PORT = 25565;
     private static final int HOST_LAN_PORT = 25566;

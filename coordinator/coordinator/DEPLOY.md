@@ -1,53 +1,31 @@
 # Deploying the Campfire coordinator
 
-Every Campfire group needs one coordinator that all players can reach. It's a single small
-Node.js process - it never runs Minecraft, so nearly any machine works: a $3–5/month VPS, a
-Raspberry Pi, or (with caveats below) someone's home PC. It needs Node 18+, `npm install`, and
-one open TCP port (default `8080`).
+Every Campfire group needs one coordinator that all players can reach.
 
 **A fresh install doesn't need any of this to just work.** `CampfireClient.DEFAULT_COORDINATOR_HOST`
-ships pointing at a community coordinator (`https://campfire-coordinator.onrender.com`) so a player
-who's never touched this file can install the mod and immediately create/join a group with zero
-setup. Everything below is for anyone who wants their OWN coordinator instead - self-hosting for
-privacy/control, or running a second one to take load off the shared default.
+ships pointing at the shared community coordinator, which runs on Cloudflare Workers + Durable
+Objects (see `coordinator/worker/README.md`) - free with no credit card, no sleep/wake delay, and it
+scales per-group automatically since every group gets its own isolated Durable Object. A player who's
+never touched this file can install the mod and immediately create/join a group with zero setup.
+
+Everything in this file is for anyone who wants their OWN coordinator instead - self-hosting for
+privacy/control, or running a second one to take load off the shared default. This one (in
+`coordinator/coordinator/`) is the plain Node.js version: a single process that never runs Minecraft,
+so nearly any machine works - a $3–5/month VPS, a Raspberry Pi, or (with caveats below) someone's
+home PC. It needs Node 18+, `npm install`, and one open TCP port (default `8080`).
 
 Whoever runs their own gives everyone in that group its address (e.g. `203.0.113.7:8080` or
 `campfire.example.com:8080`). The person who creates the group types that address once in the
 "Light a New Campfire" screen - after that, the invite code they share
 (`ABCD123XYZ@203.0.113.7:8080`) carries the address to everyone automatically.
 
-## Before this default coordinator is ready for real public-scale traffic
-
-Tonight's Render + GitHub-Releases setup was built and sized for a single friend group, and two
-things about it specifically do NOT hold up once this is actually the default for anyone who
-downloads the mod, not just one group:
-
-- **Save storage**: backing up save zips to GitHub Releases in this repo works fine for one
-  group's saves, but is the wrong place for potentially thousands of unrelated strangers' Minecraft
-  worlds - it mixes other people's private game data into the maintainer's own personal code repo,
-  and GitHub Releases isn't built to be a general-purpose multi-tenant blob store at that volume.
-  Real public use needs actual object storage (S3-compatible - R2, Backblaze B2, etc.), most likely
-  on a paid tier.
-- **Compute**: the Render Free instance (512MB RAM, 0.1 CPU, sleeps after 15 min idle) is sized for
-  one group's occasional traffic, not concurrent groups at real scale. Growing usage will need a
-  paid Render plan (or equivalent) with more headroom, and likely horizontal scaling eventually -
-  which also means revisiting the in-memory `groups` Map, since that only works as one process.
-- **Abuse/moderation**: `POST /groups/new` has a basic per-IP rate limit, but there's no real abuse
-  handling (e.g. someone scripting mass group creation from many IPs, or uploading non-Minecraft
-  data as a "save") sized for public internet traffic rather than a friend group.
-
-None of this blocks using the mod today - it just means "default coordinator" should be treated as
-an early/best-effort service until it's rebuilt on real infrastructure, not something to advertise
-as production-grade yet.
-
-**The whole point of this design is that the coordinator's address never changes.** Nobody's game
+**The whole point of this design is that a coordinator's address never changes.** Nobody's game
 client needs to "discover" a new coordinator when the host changes - only who's hosting changes,
-never who's the coordinator. So the right way to think about this section isn't "which option do I
-pick per-session" - it's "one person in the group sets this up ONE time, on a machine that stays
-on, and everyone forgets about it." The recommended path below is free forever and survives
-reboots/crashes on its own.
+never who's the coordinator. So the right way to think about the options below isn't "which one do I
+pick per-session" - it's "one person in the group sets this up ONE time, on something that stays up,
+and everyone forgets about it."
 
-## Recommended: free, no credit card, no home PC required
+## Self-hosting with Render: free, no credit card, no home PC required
 
 Two things had to both be true and turned out to be in tension: genuinely free-forever compute
 without a card on file (Oracle/Fly/GCP/AWS/Azure all require one now, specifically to stop free-tier
