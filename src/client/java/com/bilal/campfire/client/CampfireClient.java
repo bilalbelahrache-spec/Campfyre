@@ -5,6 +5,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ConnectScreen;
 import net.minecraft.client.gui.screen.TitleScreen;
@@ -42,6 +43,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.Locale;
@@ -220,7 +222,12 @@ public class CampfireClient implements ClientModInitializer {
     // One member of the group, straight from the coordinator's live 'state'
     // roster. Order follows the hosting queue: members.get(0) is the current
     // host (or next in line), so screens can show "next up" naturally.
-    record GroupMember(String id, String name, boolean host, boolean you) {
+    // modMismatch is true when this member's mod list hash differs from our
+    // own (never true for "you" - comparing yourself to yourself is
+    // meaningless); modCount is -1 when the coordinator/that client is too
+    // old to report one at all, so screens can tell "known to differ" from
+    // "nothing to compare".
+    record GroupMember(String id, String name, boolean host, boolean you, boolean modMismatch, int modCount) {
     }
 
     // A group member the coordinator remembers by name but who isn't online
@@ -229,6 +236,43 @@ public class CampfireClient implements ClientModInitializer {
     // second. lastSeenMs is 0 when the coordinator doesn't know (it only
     // tracks departures since its own start).
     record AwayMember(String name, long lastSeenMs) {
+    }
+
+    // A fingerprint of every mod actually loaded (id@version, sorted so load
+    // order can't change it), hashed once at class-init and sent with every
+    // 'hello'. Campfire's host role rotates between EVERY player, unlike a
+    // normal modded server where one machine's mod list is the only one that
+    // matters forever - here, any mismatch will eventually land on someone's
+    // machine as host, so catching it before that (in the roster UI) instead
+    // of via a failed connection or a silently corrupted save is the whole
+    // point. Computed once since a running client's mod set can't change
+    // mid-session; MOD_LIST_HASH is null if hashing failed for any reason
+    // (mismatch detection just becomes unavailable that session, never fatal).
+    private static final String MOD_LIST_HASH;
+    private static final int MOD_COUNT;
+    static {
+        String hash;
+        int count;
+        try {
+            java.util.List<String> entries = new java.util.ArrayList<>();
+            for (ModContainer mod : FabricLoader.getInstance().getAllMods()) {
+                entries.add(mod.getMetadata().getId() + "@" + mod.getMetadata().getVersion().getFriendlyString());
+            }
+            count = entries.size();
+            java.util.Collections.sort(entries);
+            String joined = String.join("\n", entries);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] digestBytes = digest.digest(joined.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(digestBytes.length * 2);
+            for (byte b : digestBytes) hex.append(String.format("%02x", b));
+            hash = hex.toString();
+        } catch (Exception e) {
+            System.out.println("[Campfire] Failed computing mod list hash - mismatch detection unavailable this session: " + e.getMessage());
+            hash = null;
+            count = -1;
+        }
+        MOD_LIST_HASH = hash;
+        MOD_COUNT = count;
     }
 
     private volatile CoordinatorStatus coordinatorStatus = CoordinatorStatus.NOT_CONFIGURED;
@@ -1152,7 +1196,14 @@ public class CampfireClient implements ClientModInitializer {
             JsonObject m = el.getAsJsonObject();
             String id = m.get("id").getAsString();
             String name = m.has("name") && !m.get("name").isJsonNull() ? m.get("name").getAsString() : id;
-            roster.add(new GroupMember(id, name, id.equals(currentHostId), id.equals(playerId)));
+            // modHash/modCount are optional - an older client or coordinator
+            // simply never sends them, which must read as "nothing to
+            // compare" rather than a false mismatch alarm.
+            String modHash = m.has("modHash") && !m.get("modHash").isJsonNull() ? m.get("modHash").getAsString() : null;
+            int modCount = m.has("modCount") && !m.get("modCount").isJsonNull() ? m.get("modCount").getAsInt() : -1;
+            boolean you = id.equals(playerId);
+            boolean modMismatch = !you && MOD_LIST_HASH != null && modHash != null && !modHash.equals(MOD_LIST_HASH);
+            roster.add(new GroupMember(id, name, id.equals(currentHostId), you, modMismatch, modCount));
         });
         roster.sort(Comparator.comparingInt(gm -> {
             int i = queueOrder.indexOf(gm.id());
@@ -1873,6 +1924,8 @@ public class CampfireClient implements ClientModInitializer {
         hello.addProperty("groupId", groupId);
         hello.addProperty("playerId", playerId);
         hello.addProperty("playerName", playerName);
+        if (MOD_LIST_HASH != null) hello.addProperty("modHash", MOD_LIST_HASH);
+        if (MOD_COUNT >= 0) hello.addProperty("modCount", MOD_COUNT);
         sendJson(hello);
     }
 

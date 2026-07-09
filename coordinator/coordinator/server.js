@@ -127,6 +127,12 @@ function getGroup(groupId) {
       members: new Map(),
       names: new Map(), // playerId -> display name (last seen in a 'hello'); kept after departure so reconnects stay labeled
       lastSeen: new Map(), // playerId -> Date.now() at departure; feeds the "seen 2h ago" away roster
+      // playerId -> { hash: <64-char lowercase sha256 hex or null>, count: <int or null> },
+      // from each 'hello'. Hosting rotates between every member here (unlike
+      // a normal modded server where one machine's mod list is the only one
+      // that ever matters), so a mismatch has to be visible in the roster
+      // BEFORE it lands on someone as host - see groupStateMessage below.
+      modHashes: new Map(),
       queue: [],
       hostId: null,
       hostDirectAddress: null,
@@ -181,10 +187,15 @@ function groupStateMessage(group) {
     hostDirectAddress: group.hostDirectAddress,
     saveVersion: group.saveVersion,
     queue: group.queue,
-    members: [...group.members.keys()].map((id) => ({
-      id,
-      name: group.names.get(id) || id,
-    })),
+    members: [...group.members.keys()].map((id) => {
+      const mh = group.modHashes.get(id);
+      return {
+        id,
+        name: group.names.get(id) || id,
+        modHash: mh ? mh.hash : null,
+        modCount: mh ? mh.count : null,
+      };
+    }),
     // Everyone the group has ever seen who ISN'T online right now, newest
     // departure first - lets clients show the whole friend circle, not just
     // who's connected this second. lastSeenMs is null for names that
@@ -356,6 +367,17 @@ wss.on('connection', (ws) => {
 
       group.members.set(playerId, ws);
       group.names.set(playerId, String(msg.playerName || playerId).slice(0, 32));
+      // Optional: an older client just never sends these, which must read as
+      // "nothing to compare" (null) rather than a false mismatch alarm - so
+      // anything not exactly a sha256 hex digest / a sane count is dropped
+      // to null rather than stored as-is.
+      const modHash = typeof msg.modHash === 'string' && /^[0-9a-f]{64}$/i.test(msg.modHash)
+        ? msg.modHash.toLowerCase()
+        : null;
+      const modCount = Number.isInteger(msg.modCount) && msg.modCount >= 0 && msg.modCount <= 5000
+        ? msg.modCount
+        : null;
+      group.modHashes.set(playerId, { hash: modHash, count: modCount });
       group.lastSeen.delete(playerId); // they're here, not "last seen"
       group.emptySince = null;
       if (!group.queue.includes(playerId)) group.queue.push(playerId);

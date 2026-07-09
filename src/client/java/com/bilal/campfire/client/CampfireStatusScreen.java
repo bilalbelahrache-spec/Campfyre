@@ -290,11 +290,28 @@ public class CampfireStatusScreen extends Screen {
             context.drawTextWithShadow(this.textRenderer, Text.literal(name), x + CampfireUi.ICON_WIDTH + 5, y,
                     m.you() ? CampfireUi.ACCENT_BRIGHT : CampfireUi.TEXT_COLOR);
 
-            String tag = m.host() ? "hosting" : (i == 0 && !mod.isSomeoneHosting() ? "next up" : null);
+            // A mod-list mismatch takes priority over the usual host/next-up
+            // tag - hosting can rotate to ANY player here, so catching a
+            // mismatch before it lands on someone as host matters more than
+            // the routine roster state.
+            String tag;
+            int tagColor;
+            if (m.modMismatch()) {
+                tag = "mods differ";
+                tagColor = CampfireUi.ERROR_COLOR;
+            } else if (m.host()) {
+                tag = "hosting";
+                tagColor = CampfireUi.ACCENT;
+            } else if (i == 0 && !mod.isSomeoneHosting()) {
+                tag = "next up";
+                tagColor = CampfireUi.MUTED_TEXT;
+            } else {
+                tag = null;
+                tagColor = CampfireUi.MUTED_TEXT;
+            }
             if (tag != null) {
                 context.drawTextWithShadow(this.textRenderer, Text.literal(tag),
-                        right - 4 - this.textRenderer.getWidth(tag), y,
-                        m.host() ? CampfireUi.ACCENT : CampfireUi.MUTED_TEXT);
+                        right - 4 - this.textRenderer.getWidth(tag), y, tagColor);
             }
             y += 12;
         }

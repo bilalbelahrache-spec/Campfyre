@@ -77,6 +77,12 @@ const DEFAULT_META = {
   queue: [],
   names: {}, // playerId -> display name, kept after departure so reconnects stay labeled
   lastSeen: {}, // playerId -> departure timestamp; feeds the "seen 2h ago" away roster
+  // playerId -> { hash: <64-char lowercase sha256 hex or null>, count: <int or null> },
+  // from each 'hello'. Hosting rotates between every member here (unlike a
+  // normal modded server where one machine's mod list is the only one that
+  // ever matters), so a mismatch has to be visible in the roster BEFORE it
+  // lands on someone as host - see groupStateMessage below.
+  modHashes: {},
   emptySince: null,
   pendingMigrationStartedAt: null,
   lastUploadActivityMs: 0,
@@ -127,6 +133,10 @@ export class CampfireGroup {
   async loaded() {
     if (!this.meta) {
       this.meta = (await this.ctx.storage.get('meta')) || structuredClone(DEFAULT_META);
+      // Migrate groups persisted before modHashes existed - loaded() returns
+      // the STORED object as-is for any group that already has one, so a
+      // field added later is simply missing rather than defaulted.
+      if (!this.meta.modHashes) this.meta.modHashes = {};
     }
     return this.meta;
   }
@@ -247,7 +257,10 @@ export class CampfireGroup {
       hostDirectAddress: m.hostDirectAddress,
       saveVersion: m.saveVersion,
       queue: m.queue,
-      members: [...this.members.keys()].map((id) => ({ id, name: m.names[id] || id })),
+      members: [...this.members.keys()].map((id) => {
+        const mh = m.modHashes[id];
+        return { id, name: m.names[id] || id, modHash: mh ? mh.hash : null, modCount: mh ? mh.count : null };
+      }),
       away: Object.keys(m.names)
         .filter((id) => !this.members.has(id))
         .map((id) => ({ id, name: m.names[id] || id, lastSeenMs: m.lastSeen[id] || null }))
@@ -292,6 +305,17 @@ export class CampfireGroup {
 
       meta.everHello = true;
       meta.names[playerId] = String(msg.playerName || playerId).slice(0, 32);
+      // Optional: an older client just never sends these, which must read as
+      // "nothing to compare" (null) rather than a false mismatch alarm - so
+      // anything not exactly a sha256 hex digest / a sane count is dropped
+      // to null rather than stored as-is.
+      const modHash = typeof msg.modHash === 'string' && /^[0-9a-f]{64}$/i.test(msg.modHash)
+        ? msg.modHash.toLowerCase()
+        : null;
+      const modCount = Number.isInteger(msg.modCount) && msg.modCount >= 0 && msg.modCount <= 5000
+        ? msg.modCount
+        : null;
+      meta.modHashes[playerId] = { hash: modHash, count: modCount };
       delete meta.lastSeen[playerId]; // they're here, not "last seen"
       meta.emptySince = null;
       await this.setAlarmFor('purge', null);
@@ -846,6 +870,7 @@ export class CampfireGroup {
     for (const id of droppable.slice(0, ids.length - MAX_REMEMBERED_NAMES)) {
       delete m.names[id];
       delete m.lastSeen[id];
+      delete m.modHashes[id];
     }
   }
 }
