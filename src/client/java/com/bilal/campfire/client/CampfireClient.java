@@ -48,8 +48,10 @@ import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -176,6 +178,20 @@ public class CampfireClient implements ClientModInitializer {
     private WebSocket webSocket;
     private String playerId;
     private String playerName;
+
+    // The JDK WebSocket client allows only one sendText() in flight at a time -
+    // a second call before the first's CompletableFuture completes fails that
+    // future with IllegalStateException, and sendJson() historically discarded
+    // that future, so the message was silently dropped. Relay traffic is the
+    // one thing that calls sendJson() in a tight loop (once per ~8KB read off
+    // a real socket), fast enough to violate that one-at-a-time rule over a
+    // real network round trip - dropping a mid-stream chunk desyncs the
+    // receiver's reassembled byte stream, which surfaces as a zlib "incorrect
+    // header check" the moment Minecraft's post-login compressed packets start
+    // flowing. Queueing and draining one send at a time fixes it for every
+    // caller, not just relay.
+    private final ConcurrentLinkedQueue<String> sendQueue = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean sendInFlight = new AtomicBoolean(false);
 
     private volatile String currentHostId;
 
@@ -686,6 +702,7 @@ public class CampfireClient implements ClientModInitializer {
         if (webSocket != null) {
             webSocket.abort();
             webSocket = null;
+            sendQueue.clear();
         }
         if (relayFriendListener != null) {
             relayFriendListener.stop();
@@ -785,6 +802,7 @@ public class CampfireClient implements ClientModInitializer {
         if (webSocket != null) {
             webSocket.abort();
             webSocket = null;
+            sendQueue.clear();
         }
         currentHostId = null;
         members = java.util.List.of();
@@ -920,6 +938,7 @@ public class CampfireClient implements ClientModInitializer {
     // require the player to relaunch their game to get back in the group.
     private void onCoordinatorConnectionLost() {
         webSocket = null;
+        sendQueue.clear();
         members = java.util.List.of();
         awayMembers = java.util.List.of();
         rosterPrimed = false; // next successful connect's first snapshot is context, not news
@@ -994,7 +1013,8 @@ public class CampfireClient implements ClientModInitializer {
         if (!isManagedWorld(server)) return;
         if (internalRestartInProgress) return; // closing our own stale copy before reloading the migrated save - not actually leaving
         if (webSocket != null) {
-            webSocket.sendText("{\"type\":\"leaving\"}", true);
+            sendQueue.add("{\"type\":\"leaving\"}");
+            pumpSendQueue();
             System.out.println("[Campfire] Sent 'leaving' to coordinator");
         }
     }
@@ -1806,9 +1826,32 @@ public class CampfireClient implements ClientModInitializer {
     }
 
     private void sendJson(JsonObject json) {
-        if (webSocket != null) {
-            webSocket.sendText(gson.toJson(json), true);
+        if (webSocket == null) return;
+        sendQueue.add(gson.toJson(json));
+        pumpSendQueue();
+    }
+
+    /** Drains sendQueue one message at a time, never starting the next send until the previous one's future completes. */
+    private void pumpSendQueue() {
+        if (!sendInFlight.compareAndSet(false, true)) return; // another pump is already draining
+        String msg = sendQueue.poll();
+        if (msg == null) {
+            sendInFlight.set(false);
+            if (!sendQueue.isEmpty()) pumpSendQueue(); // item snuck in between poll() and the flag reset
+            return;
         }
+        WebSocket ws = webSocket;
+        if (ws == null) {
+            sendInFlight.set(false);
+            return;
+        }
+        ws.sendText(msg, true).whenComplete((w, err) -> {
+            if (err != null) {
+                System.out.println("[Campfire] Failed sending to coordinator: " + err.getMessage());
+            }
+            sendInFlight.set(false);
+            pumpSendQueue();
+        });
     }
 
     // Announces us to the coordinator - both on first connect, and again
