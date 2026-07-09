@@ -1,36 +1,156 @@
 // Coordinator server for the host-migration Minecraft mod.
 //
-// Responsibilities (and ONLY these — it never simulates the world):
+// Responsibilities:
 //   1. Track which players are currently online, per friend-group ("group").
 //   2. Know the join order, so it can pick who becomes host next.
 //   3. Broadcast a "migrate" message telling everyone to reconnect to the new host.
 //   4. Hold the latest zipped world save so the next host can pull it before
 //      opening the world (simple file relay, nothing fancy).
+//   5. Relay live Minecraft traffic between friends and whoever's hosting,
+//      so friends can join and play in real time without any port forwarding
+//      on anyone's end. The coordinator never looks inside the bytes — it's
+//      a switchboard, not a game server.
 //
 // This is intentionally dumb and small. It's a phone book + a dead-drop for
-// the save file, not a game server. That's what keeps it free to run.
+// the save file + a traffic switchboard. That's what keeps it free to run.
 
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
+const githubBackup = require('./githubBackup');
 
 const PORT = process.env.PORT || 8080;
 const SAVES_DIR = path.join(__dirname, 'saves');
+const TRASH_DIR = path.join(SAVES_DIR, '_trash');
 fs.mkdirSync(SAVES_DIR, { recursive: true });
+fs.mkdirSync(TRASH_DIR, { recursive: true });
+
+// How long to wait for the outgoing host's save upload to land before
+// migrating anyway with whatever save version we've got. This is what
+// keeps a migration from hanging forever if the upload never arrives
+// (failed upload, or a host that crashed instead of quitting cleanly and
+// never got to upload at all).
+//
+// BUT: this base window only covers "did an upload even show up?". A real
+// world zip is a couple hundred MB, and a real test saw one take ~35s
+// (slow link + a transient rename failure forcing client retries) - the
+// 15s timer fired mid-upload and migrated the next host onto a STALE save,
+// with the fresh one landing 20s later. So while an upload for the group
+// is actively in flight (or one very recently was - the client waits 2.5s
+// between retry attempts), the timeout extends itself in small increments
+// instead of firing, up to a hard cap so a wedged upload can never hold a
+// migration hostage forever.
+const MIGRATE_UPLOAD_TIMEOUT_MS = 15000;
+const MIGRATE_UPLOAD_EXTENSION_MS = 5000;
+const MIGRATE_UPLOAD_RECENT_ACTIVITY_MS = 8000;
+const MIGRATE_UPLOAD_HARD_CAP_MS = 180000;
+
+// Dead-connection detection for the WebSocket side. Without this, a client
+// that vanishes without a clean TCP close (power loss, network drop, a
+// wedged game) stays in the group's members map INDEFINITELY - and a ghost
+// "host" entry permanently blocks everyone else's im_hosting claim
+// (already_hosting checks members.has(hostId)). Ping every sweep; anyone
+// who shows no sign of life for two consecutive sweeps gets terminated,
+// which fires their normal 'close' -> handleDeparture cleanup.
+const HEARTBEAT_INTERVAL_MS = 30000;
+
+// A real friend group can easily go quiet for weeks (school, work, a break
+// from the game) and come back expecting their world exactly as they left
+// it - a save file is the only copy of that world that exists anywhere, so
+// nothing here is allowed to just delete it on a whim. Retention is two
+// stages instead of one outright delete:
+//   1. After ARCHIVE_AFTER_MS with nobody online, the save is *moved* to a
+//      trash folder (not deleted) and its in-memory bookkeeping is dropped
+//      (that part's harmless either way - reconnecting recreates it).
+//   2. Only after another PURGE_AFTER_MS sitting untouched in trash does it
+//      actually get deleted. Reconnecting/downloading at any point before
+//      that automatically restores it from trash first - see
+//      restoreFromTrashIfNeeded().
+// ~6 months to archive, ~3 more to purge - generous enough that "we haven't
+// played in a while" is never mistaken for "we're never coming back."
+const ARCHIVE_AFTER_MS = 180 * 24 * 60 * 60 * 1000;
+const PURGE_AFTER_MS = 90 * 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// groupId is used directly as a filename (saves/<groupId>.zip) and as a
+// WebSocket routing key, so it must be restricted to a safe, predictable
+// charset - otherwise a crafted groupId like "../../../etc" could read or
+// overwrite files outside SAVES_DIR entirely (path traversal).
+function isValidGroupId(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+}
+
+// Invite codes for new groups: anyone who knows a groupId can join that
+// group, become host, and download/overwrite its save - there's no
+// separate password/account layer. So a group's real security is that its
+// id is unguessable, not memorable. 10 chars from a 32-symbol alphabet
+// (no 0/O/1/I/L, easy to misread aloud) is ~50 bits of entropy - far too
+// many combinations to brute-force by guessing, while still short enough
+// to read out over Discord voice chat.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+function generateGroupCode() {
+  let code;
+  do {
+    code = '';
+    const bytes = crypto.randomBytes(10);
+    for (let i = 0; i < 10; i++) code += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  } while (groups.has(code)); // vanishingly unlikely, but never hand out a code already in use
+  return code;
+}
+
+// playerId is echoed back to OTHER players (as hostId/newHostId) and those
+// clients use it to build local file paths for their own player data
+// (playerdata/<id>.dat). The mod only ever sends real UUIDs, but the
+// coordinator can't assume every connecting client is the real mod - a
+// crafted playerId could otherwise plant "../" segments that land in some
+// other player's playerdata write path. Same safe charset as groupId
+// (rather than requiring UUID shape specifically) so dev/test tooling can
+// still use plain readable ids like "alice"/"bob".
+function isValidPlayerId(id) {
+  return isValidGroupId(id);
+}
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-// groupId -> { members: Map<playerId, ws>, queue: [playerId,...], hostId: string|null, saveVersion: number }
+// groupId -> { members: Map<playerId, ws>, queue: [playerId,...], hostId: string|null,
+//              saveVersion: number, pendingMigration: { timer } | null }
 const groups = new Map();
 
 function getGroup(groupId) {
   if (!groups.has(groupId)) {
-    groups.set(groupId, { members: new Map(), queue: [], hostId: null, saveVersion: 0 });
+    groups.set(groupId, {
+      members: new Map(),
+      names: new Map(), // playerId -> display name (last seen in a 'hello'); kept after departure so reconnects stay labeled
+      lastSeen: new Map(), // playerId -> Date.now() at departure; feeds the "seen 2h ago" away roster
+      queue: [],
+      hostId: null,
+      hostDirectAddress: null,
+      // saveVersion bookkeeping is in-memory, but the save zip itself
+      // survives restarts on disk. Seed 1 when a zip exists so a client
+      // comparing its own persisted "version of my local copy" against ours
+      // sees a mismatch and re-downloads, instead of trusting a local copy
+      // that may be older than what's sitting in saves/.
+      saveVersion: fs.existsSync(path.join(SAVES_DIR, `${groupId}.zip`)) ? 1 : 0,
+      pendingMigration: null,
+      // Who most recently ACTUALLY hosted (set on im_hosting, survives their
+      // departure). Rides on 'migrate' as previousHostId so the incoming host
+      // knows whose player data sits inside the save's level.dat and can
+      // preserve it - clients can't track this themselves, since hostId is
+      // already null in every state they see by the time migrate arrives.
+      lastHostId: null,
+      // Live-upload bookkeeping for the migration timeout above: how many
+      // save POSTs are streaming right now, and when one last started or
+      // finished. Maintained by the middleware on the upload route.
+      uploadsInFlight: 0,
+      lastUploadActivityMs: 0,
+      emptySince: null,
+    });
   }
   return groups.get(groupId);
 }
@@ -45,30 +165,175 @@ function broadcast(group, msg, exceptId = null) {
   }
 }
 
+// One authoritative snapshot of the group, sent to EVERYONE whenever
+// membership or hosting changes - not just to a newcomer on hello. This is
+// what lets every client render a live "who's around the fire" roster
+// (names, who's hosting, queue order) instead of only ever knowing the
+// hostId. Clients that predate the 'members' field just ignore it.
+function groupStateMessage(group) {
+  return {
+    type: 'state',
+    hostId: group.hostId,
+    hostDirectAddress: group.hostDirectAddress,
+    saveVersion: group.saveVersion,
+    queue: group.queue,
+    members: [...group.members.keys()].map((id) => ({
+      id,
+      name: group.names.get(id) || id,
+    })),
+    // Everyone the group has ever seen who ISN'T online right now, newest
+    // departure first - lets clients show the whole friend circle, not just
+    // who's connected this second. lastSeenMs is null for names that
+    // predate this server process (names survive only in memory).
+    // Older clients simply ignore this field.
+    away: [...group.names.keys()]
+      .filter((id) => !group.members.has(id))
+      .map((id) => ({
+        id,
+        name: group.names.get(id) || id,
+        lastSeenMs: group.lastSeen.get(id) || null,
+      }))
+      .sort((a, b) => (b.lastSeenMs || 0) - (a.lastSeenMs || 0))
+      .slice(0, 8),
+  };
+}
+
+function broadcastState(group) {
+  broadcast(group, groupStateMessage(group));
+}
+
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-// Picks the next host from the queue, skipping anyone no longer connected.
-function promoteNextHost(groupId) {
+// Picks the next host candidate from the queue, skipping anyone no longer
+// connected. Deliberately does NOT set group.hostId: being chosen is a
+// designation, not a confirmation. hostId only ever gets set by 'im_hosting'
+// - i.e. when the designated player has actually downloaded the save, opened
+// the world, and opened it to LAN. Between those two moments the group
+// truthfully has no host (state broadcasts say so), which is what stops
+// friends' screens from offering "Join X's World" toward someone whose
+// world isn't actually running yet - and means a designated host who never
+// opens the world (quit the game, walked away) just falls out of the queue
+// and the next person's screen offers hosting instead, with no stuck state.
+function pickNextHost(groupId) {
   const group = getGroup(groupId);
-  group.hostId = null;
   while (group.queue.length > 0) {
     const candidate = group.queue[0];
-    if (group.members.has(candidate)) {
-      group.hostId = candidate;
-      break;
-    }
+    if (group.members.has(candidate)) return candidate;
     group.queue.shift();
   }
-  return group.hostId;
+  return null;
+}
+
+// --- Migration gating (fixes the stale-save race) ---
+//
+// When a host leaves, we don't immediately promote+migrate. We wait until
+// their save upload has actually landed (bumping saveVersion), or until the
+// timeout fires, and only THEN broadcast "migrate" - so the new host is
+// always told about a save version that's really sitting on disk, never one
+// that's about to be replaced seconds later.
+
+function beginPendingMigration(groupId) {
+  const group = getGroup(groupId);
+
+  if (group.pendingMigration) {
+    // Already waiting on a previous departure - let that one resolve.
+    return;
+  }
+
+  const timer = setTimeout(() => onPendingMigrationTimeout(groupId), MIGRATE_UPLOAD_TIMEOUT_MS);
+  group.pendingMigration = { timer, startedAt: Date.now() };
+}
+
+function onPendingMigrationTimeout(groupId) {
+  const group = getGroup(groupId);
+  if (!group.pendingMigration) return;
+
+  // An upload that's still streaming (or was active seconds ago - the mod
+  // waits 2.5s between retry attempts, so a brief gap between attempts
+  // doesn't mean it gave up) is EXACTLY what this wait exists for. Don't
+  // cut it off just because the world is big or the link is slow; keep
+  // extending in small steps until it lands or the hard cap says a wedged
+  // upload can't hold the whole group hostage.
+  const waitedMs = Date.now() - group.pendingMigration.startedAt;
+  const uploadLooksAlive = group.uploadsInFlight > 0
+    || (group.lastUploadActivityMs > 0 && Date.now() - group.lastUploadActivityMs < MIGRATE_UPLOAD_RECENT_ACTIVITY_MS);
+  if (uploadLooksAlive && waitedMs < MIGRATE_UPLOAD_HARD_CAP_MS) {
+    log(`[${groupId}] departing host's upload still in flight after ${Math.round(waitedMs / 1000)}s - holding the migration for it`);
+    group.pendingMigration.timer = setTimeout(() => onPendingMigrationTimeout(groupId), MIGRATE_UPLOAD_EXTENSION_MS);
+    return;
+  }
+
+  log(`[${groupId}] upload didn't arrive within ${Math.round(waitedMs / 1000)}s - migrating with last known save v${group.saveVersion} anyway`);
+  resolvePendingMigration(groupId);
+}
+
+function resolvePendingMigration(groupId) {
+  const group = getGroup(groupId);
+  if (!group.pendingMigration) return;
+
+  clearTimeout(group.pendingMigration.timer);
+  group.pendingMigration = null;
+
+  const newHost = pickNextHost(groupId);
+  if (newHost) {
+    log(`[${groupId}] migrating host -> ${newHost} (save v${group.saveVersion}, previous host ${group.lastHostId || 'unknown'})`);
+    broadcast(group, {
+      type: 'migrate',
+      newHostId: newHost,
+      saveVersion: group.saveVersion,
+      previousHostId: group.lastHostId || null,
+    });
+    broadcastState(group); // hostId stays null until the new host's im_hosting lands
+  } else {
+    log(`[${groupId}] no one left to host`);
+  }
+}
+
+// --- Relay switchboard ---
+//
+// Friends never talk to each other directly. Everything goes:
+//   friend -> coordinator -> host   (relay_open / relay_data / relay_close, no target needed — always means "the host")
+//   host -> coordinator -> friend   (same message types, but MUST include toPlayerId — the host may have several friends' streams open at once)
+//
+// The coordinator's only job is to stamp "fromPlayerId" on the way to the host,
+// and route by "toPlayerId" on the way back. It never inspects msg.data.
+
+function relayToHost(group, fromPlayerId, msg) {
+  const hostWs = group.hostId ? group.members.get(group.hostId) : null;
+  if (!hostWs) {
+    const senderWs = group.members.get(fromPlayerId);
+    if (senderWs) send(senderWs, { type: 'relay_error', streamId: msg.streamId, reason: 'no_host' });
+    log(`[relay] dropped ${msg.type} from ${fromPlayerId} - no host connected`);
+    return;
+  }
+  send(hostWs, { ...msg, fromPlayerId });
+}
+
+function relayToPlayer(group, toPlayerId, msg) {
+  const targetWs = group.members.get(toPlayerId);
+  if (!targetWs) {
+    log(`[relay] dropped ${msg.type} to ${toPlayerId} - not connected`);
+    return;
+  }
+  send(targetWs, msg);
 }
 
 wss.on('connection', (ws) => {
   let groupId = null;
   let playerId = null;
 
+  // Heartbeat bookkeeping (see HEARTBEAT_INTERVAL_MS). Any sign of life
+  // counts: a pong reply to our ping, the client's OWN keepalive pings
+  // (the mod sends one every ~20s partly to keep NAT mappings warm), or
+  // any real message.
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('ping', () => { ws.isAlive = true; });
+
   ws.on('message', (raw) => {
+    ws.isAlive = true;
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -77,30 +342,39 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'hello') {
+      if (!isValidGroupId(msg.groupId) || !isValidPlayerId(msg.playerId)) {
+        send(ws, { type: 'error', reason: 'invalid_id' });
+        return;
+      }
       groupId = msg.groupId;
       playerId = msg.playerId;
       const group = getGroup(groupId);
 
       group.members.set(playerId, ws);
+      group.names.set(playerId, String(msg.playerName || playerId).slice(0, 32));
+      group.lastSeen.delete(playerId); // they're here, not "last seen"
+      group.emptySince = null;
       if (!group.queue.includes(playerId)) group.queue.push(playerId);
 
       log(`[${groupId}] ${msg.playerName || playerId} connected`);
 
-      // Tell the newcomer the current state: who's host, what save version exists.
-      send(ws, {
-        type: 'state',
-        hostId: group.hostId,
-        saveVersion: group.saveVersion,
-        queue: group.queue,
-      });
+      // Everyone (newcomer included) gets the fresh state: who's host, what
+      // save version exists, the host's direct address if UPnP already
+      // resolved one (so a friend joining after that point can skip the
+      // relay entirely), and the live member roster - existing members see
+      // the new arrival appear without waiting for anything else to happen.
+      broadcastState(group);
 
-      // If nobody's hosting yet, this player becomes host candidate immediately.
-      if (!group.hostId) {
-        const newHost = promoteNextHost(groupId);
-        if (newHost) {
-          broadcast(group, { type: 'migrate', newHostId: newHost, saveVersion: group.saveVersion });
-        }
-      }
+      // Deliberately NO auto-promotion here. This used to broadcast a
+      // 'migrate' naming the newcomer host the moment they said hello, which
+      // meant simply LAUNCHING the game hijacked the player into a download
+      // + world-list screen before they'd clicked anything. Hosting is now
+      // claim-based: the queue-front player's status screen offers "Open the
+      // World" (pulling the latest save first), and actually opening it
+      // sends 'im_hosting' - that's when hostId gets set. Mid-session
+      // handoffs (host disconnects while friends wait) still use the
+      // beginPendingMigration -> 'migrate' path below, which is unrelated to
+      // this hello branch.
       return;
     }
 
@@ -109,21 +383,103 @@ wss.on('connection', (ws) => {
     const group = getGroup(groupId);
 
     if (msg.type === 'im_hosting') {
+      // Hosting is claim-based (see the hello handler), so guard the claim:
+      // if someone else is ALREADY actively hosting and still connected, a
+      // second im_hosting (e.g. another player opening their local copy of
+      // the world on the side) must not steal the group's relay routing out
+      // from under the live session.
+      if (group.hostId && group.hostId !== playerId && group.members.has(group.hostId)) {
+        log(`[${groupId}] ${playerId} tried to claim host but ${group.hostId} is already hosting - rejected`);
+        send(ws, { type: 'error', reason: 'already_hosting' });
+        return;
+      }
       group.hostId = playerId;
+      group.lastHostId = playerId;
+      // A new host's direct address (if any) hasn't been discovered yet -
+      // UPnP mapping happens after this and arrives as a separate
+      // 'direct_address' message, possibly several seconds later. Clearing
+      // it here stops friends from trying to reach the PREVIOUS host's
+      // now-stale address.
+      group.hostDirectAddress = null;
       broadcast(group, { type: 'host_confirmed', hostId: playerId }, playerId);
+      broadcastState(group); // rosters everywhere should now show this player as host
       log(`[${groupId}] ${playerId} is now hosting`);
       return;
     }
 
+    // Sent by the host once its own UPnP port-mapping attempt resolves -
+    // may arrive well after 'im_hosting', or not at all if UPnP isn't
+    // available on the host's network. Only the current host is trusted to
+    // set this (a friend claiming to be host here would just be lying about
+    // an address, not gaining any access they don't already have).
+    if (msg.type === 'direct_address') {
+      if (playerId !== group.hostId) return;
+      group.hostDirectAddress = typeof msg.address === 'string' ? msg.address : null;
+      broadcast(group, { type: 'host_direct_address', address: group.hostDirectAddress }, playerId);
+      log(`[${groupId}] host direct address: ${group.hostDirectAddress || '(none - UPnP unavailable)'}`);
+      return;
+    }
+
     if (msg.type === 'save_uploaded') {
-      // Client tells us it finished uploading via the HTTP endpoint below.
-      group.saveVersion += 1;
-      log(`[${groupId}] save updated to v${group.saveVersion} by ${playerId}`);
+      // Legacy no-op. The HTTP upload handler is the ONE place saveVersion
+      // gets bumped - bumping here too would double-count any client that
+      // sends both, desyncing every client's persisted localSaveVersion
+      // (which the upload response echoes) and forcing spurious
+      // re-downloads. No shipped client sends this; kept only so an old
+      // client doing so gets silence instead of an error.
       return;
     }
 
     if (msg.type === 'leaving') {
       handleDeparture(groupId, playerId);
+      return;
+    }
+
+    // --- Hole-punch signaling (STUN-style address exchange for direct P2P) ---
+    //
+    // Same "one target is implied" convention as the relay messages below: a
+    // friend sending this always means "to the host" (there's only ever
+    // one), while the host sending it back MUST include toPlayerId, since it
+    // may be answering whichever friend most recently asked. The coordinator
+    // only ever passes the address string through - it never validates or
+    // interprets it, same as it never inspects relay_data's payload.
+    if (msg.type === 'punch_candidate') {
+      const isHost = playerId === group.hostId;
+      if (isHost) {
+        if (!msg.toPlayerId) {
+          log(`[punch] host ${playerId} sent punch_candidate with no toPlayerId - dropped`);
+          return;
+        }
+        relayToPlayer(group, msg.toPlayerId, { type: 'punch_candidate', address: msg.address });
+      } else {
+        relayToHost(group, playerId, { type: 'punch_candidate', address: msg.address });
+      }
+      return;
+    }
+
+    // --- Relay messages ---
+    if (msg.type === 'relay_open' || msg.type === 'relay_data' || msg.type === 'relay_close') {
+      const isHost = playerId === group.hostId;
+
+      if (isHost) {
+        // Host -> a specific friend. toPlayerId is required.
+        if (!msg.toPlayerId) {
+          log(`[relay] host ${playerId} sent ${msg.type} with no toPlayerId - dropped`);
+          return;
+        }
+        relayToPlayer(group, msg.toPlayerId, {
+          type: msg.type,
+          streamId: msg.streamId,
+          data: msg.data, // present on relay_data only, harmless undefined otherwise
+        });
+      } else {
+        // Friend -> the host, whoever that currently is.
+        relayToHost(group, playerId, {
+          type: msg.type,
+          streamId: msg.streamId,
+          data: msg.data,
+        });
+      }
       return;
     }
   });
@@ -133,22 +489,62 @@ wss.on('connection', (ws) => {
   });
 });
 
+// The heartbeat sweep itself: anyone who hasn't shown a sign of life since
+// the previous sweep is presumed gone and terminated - terminate() fires
+// their 'close' handler, so departure cleanup (including host migration if
+// the ghost was hosting) runs exactly as if they'd disconnected cleanly.
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* socket already dying - the next sweep reaps it */ }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
 function handleDeparture(groupId, playerId) {
   const group = getGroup(groupId);
+
+  if (!group.members.has(playerId) && !group.queue.includes(playerId)) {
+    return; // already processed - the 'leaving' message and the socket
+             // close event both call this for a normal clean quit
+  }
+
   const wasHost = group.hostId === playerId;
 
   group.members.delete(playerId);
   group.queue = group.queue.filter((id) => id !== playerId);
+  group.lastSeen.set(playerId, Date.now());
   log(`[${groupId}] ${playerId} left${wasHost ? ' (was host)' : ''}`);
 
+  if (group.members.size === 0) {
+    group.emptySince = Date.now();
+  }
+
   if (wasHost) {
-    const newHost = promoteNextHost(groupId);
-    if (newHost) {
-      log(`[${groupId}] migrating host -> ${newHost}`);
-      broadcast(group, { type: 'migrate', newHostId: newHost, saveVersion: group.saveVersion });
-    } else {
+    // Nobody left to relay to right now - tell everyone still connected to
+    // close out any open relay streams cleanly instead of hanging.
+    broadcast(group, { type: 'relay_reset', reason: 'host_left' });
+    group.hostId = null;
+  }
+
+  // Everyone still connected sees the departure immediately - previously a
+  // NON-host quitting was completely invisible to the rest of the group.
+  // Broadcast AFTER hostId is cleared above, so a departing host's roster
+  // update already reads "no host" instead of naming someone who's gone.
+  broadcastState(group);
+
+  if (wasHost) {
+    if (group.queue.length === 0) {
       log(`[${groupId}] no one left to host`);
+      return;
     }
+
+    // Don't migrate yet - wait for the outgoing host's save upload to land
+    // (or time out) so the new host never downloads a stale version.
+    beginPendingMigration(groupId);
   }
 }
 
@@ -156,27 +552,307 @@ function handleDeparture(groupId, playerId) {
 
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2GB cap for now
 
-app.post('/groups/:groupId/save', upload.single('save'), (req, res) => {
+// If a group's save was archived to trash for inactivity and someone just
+// reconnected/uploaded/downloaded, that's proof the group isn't abandoned
+// after all - bring it back before doing anything else.
+function restoreFromTrashIfNeeded(groupId) {
+  const trashPath = path.join(TRASH_DIR, `${groupId}.zip`);
+  const livePath = path.join(SAVES_DIR, `${groupId}.zip`);
+  if (fs.existsSync(trashPath) && !fs.existsSync(livePath)) {
+    fs.renameSync(trashPath, livePath);
+    log(`[${groupId}] welcome back - restored save from trash`);
+  }
+}
+
+// Windows can transiently refuse a rename when something else briefly holds
+// either file open - the observed culprit is antivirus scanning a
+// freshly-written multi-hundred-MB temp the instant it's closed. A real
+// session hit EPERM here twice in a row, each failure costing the departing
+// host a full re-upload of the entire zip AND delaying the save landing past
+// the migration window (-> stale-save migrate). The file itself is fine and
+// the lock clears in seconds, so retry with backoff before declaring defeat.
+function renameWithRetry(src, dest, attempts = 15, delayMs = 400) {
+  return new Promise((resolve, reject) => {
+    const tryOnce = (remaining) => {
+      try {
+        fs.renameSync(src, dest);
+        resolve();
+      } catch (e) {
+        if (remaining <= 1 || !['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) {
+          reject(e);
+          return;
+        }
+        setTimeout(() => tryOnce(remaining - 1), delayMs);
+      }
+    };
+    tryOnce(attempts);
+  });
+}
+
+// Runs BEFORE multer parses the body, so the group knows an upload is
+// actively streaming from the moment its first bytes arrive - that's what
+// lets the migration timeout (onPendingMigrationTimeout) hold the handoff
+// for an upload that's genuinely underway instead of firing mid-transfer.
+function markUploadInFlight(req, res, next) {
   const { groupId } = req.params;
-  if (!req.file) return res.status(400).send('missing file');
+  if (isValidGroupId(groupId)) {
+    const group = getGroup(groupId);
+    group.uploadsInFlight += 1;
+    group.lastUploadActivityMs = Date.now();
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+      group.lastUploadActivityMs = Date.now();
+    };
+    res.on('finish', settle);
+    res.on('close', settle);
+  }
+  next();
+}
+
+app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), async (req, res) => {
+  const { groupId } = req.params;
+  if (!isValidGroupId(groupId)) return res.status(400).json({ error: 'invalid group id' });
+  if (!req.file) return res.status(400).json({ error: 'missing file' });
+  // The stored zip is the ONLY copy of the group's world - never let
+  // garbage replace it. Cheap sanity check (every zip starts with "PK"),
+  // then write-to-temp + rename so a crash/disk-full mid-write can never
+  // leave a half-written file where the good save used to be. rename() on
+  // the same filesystem is atomic; the good save exists untouched right up
+  // until the complete new one takes its place.
+  const buf = req.file.buffer;
+  if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+    log(`[${groupId}] rejected save upload - not a zip (${buf.length} bytes)`);
+    return res.status(400).json({ error: 'not a zip' });
+  }
+  restoreFromTrashIfNeeded(groupId);
   const dest = path.join(SAVES_DIR, `${groupId}.zip`);
-  fs.writeFileSync(dest, req.file.buffer);
+  const tmp = `${dest}.uploading`;
+  fs.writeFileSync(tmp, buf);
+  try {
+    await renameWithRetry(tmp, dest);
+  } catch (e) {
+    log(`[${groupId}] save upload failed - couldn't move the new zip into place: ${e.message}`);
+    try { fs.unlinkSync(tmp); } catch { /* sweep gets it later */ }
+    // 5xx on purpose: the mod's upload loop retries 5xx (it can heal),
+    // never 4xx.
+    return res.status(503).json({ error: 'save file busy - retry' });
+  }
   const group = getGroup(groupId);
   group.saveVersion += 1;
   broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
   log(`[${groupId}] save uploaded (${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
+  // Best-effort, doesn't block the response the mod is waiting on - see
+  // githubBackup.js for why this exists (free sleep-tier hosts wipe local
+  // disk on every spin-down/spin-up).
+  githubBackup.backupSaveToGithub(groupId, buf);
+
+  // If a host departure is waiting on exactly this upload, this is the
+  // signal it's been waiting for - migrate now, with the version we just set.
+  if (group.pendingMigration) {
+    resolvePendingMigration(groupId);
+  }
+
   res.json({ ok: true, saveVersion: group.saveVersion });
 });
 
 app.get('/groups/:groupId/save', (req, res) => {
   const { groupId } = req.params;
+  if (!isValidGroupId(groupId)) return res.status(400).send('invalid group id');
+  restoreFromTrashIfNeeded(groupId);
   const filePath = path.join(SAVES_DIR, `${groupId}.zip`);
   if (!fs.existsSync(filePath)) return res.status(404).send('no save yet');
   res.download(filePath, `${groupId}.zip`);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, groups: groups.size }));
+// Lets a friend's "Join a Campfire" screen check a code before committing to
+// it. getGroup() lazily creates a group on the first 'hello' regardless of
+// whether that code was ever really handed out by anyone - so a typo'd or
+// made-up (but still validly-charset) code would otherwise silently spin up
+// a brand-new empty group instead of surfacing as wrong. A group that has
+// never had anyone say hello AND has no uploaded save (live or archived in
+// trash) has definitely never really existed, so that's what "exists" means
+// here - checked ahead of ever opening a websocket for it.
+app.get('/groups/:groupId/exists', (req, res) => {
+  const { groupId } = req.params;
+  if (!isValidGroupId(groupId)) return res.status(400).send('invalid group id');
+  restoreFromTrashIfNeeded(groupId);
+  const hasSave = fs.existsSync(path.join(SAVES_DIR, `${groupId}.zip`));
+  res.json({ exists: hasSave || groups.has(groupId) });
+});
 
-server.listen(PORT, () => log(`coordinator listening on :${PORT}`));
+// Ambient presence for the mod's "Your Campfires" list screen: who's online
+// and who's hosting in a group WITHOUT joining its websocket (a client only
+// ever holds one live websocket - its active campfire - but the list screen
+// shows all of them). Read-only on purpose: never getGroup() (a poll must
+// not lazily create groups), never restoreFromTrashIfNeeded (a passive
+// look-in isn't the "they're back" signal that justifies un-archiving).
+// Knowing the groupId is already full access to the group (its id IS its
+// access control), so this reveals nothing an owner of the code couldn't
+// get by connecting.
+app.get('/groups/:groupId/status', (req, res) => {
+  const { groupId } = req.params;
+  if (!isValidGroupId(groupId)) return res.status(400).json({ error: 'invalid group id' });
+  const group = groups.get(groupId) || null;
+  const hasSave = fs.existsSync(path.join(SAVES_DIR, `${groupId}.zip`))
+    || fs.existsSync(path.join(TRASH_DIR, `${groupId}.zip`));
+  if (!group && !hasSave) return res.status(404).json({ exists: false });
+  res.json({
+    exists: true,
+    online: group ? group.members.size : 0,
+    memberNames: group ? [...group.members.keys()].map((id) => group.names.get(id) || id) : [],
+    hostName: group && group.hostId ? (group.names.get(group.hostId) || group.hostId) : null,
+    saveVersion: group ? group.saveVersion : (hasSave ? 1 : 0),
+  });
+});
+
+// Mint a brand-new, unguessable group id - this is how a fresh friend group
+// gets created for a real deploy (as opposed to dev/test setups that just
+// hardcode a shared groupId like "dev-test-group"). Nothing needs to be
+// created in `groups` yet - getGroup() lazily creates it the moment the
+// first player actually says hello.
+// Minting is unauthenticated by design (a fresh install has no identity
+// yet), which also makes it the one endpoint a bored script could hammer
+// for free. Codes cost nothing until someone says hello, so the only real
+// risk is log spam/noise - a generous per-IP cap kills that without ever
+// getting in the way of a legitimate friend group (who mint one code,
+// ever). In-memory, pruned on the cleanup sweep.
+const MINT_LIMIT_PER_HOUR = 20;
+const MINT_WINDOW_MS = 60 * 60 * 1000;
+const mintHistory = new Map(); // ip -> [timestamps within the window]
+
+app.post('/groups/new', (req, res) => {
+  const ip = req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const recent = (mintHistory.get(ip) || []).filter((t) => now - t < MINT_WINDOW_MS);
+  if (recent.length >= MINT_LIMIT_PER_HOUR) {
+    log(`[mint] rate-limited ${ip}`);
+    return res.status(429).send('too many new groups from this address - try again later');
+  }
+  recent.push(now);
+  mintHistory.set(ip, recent);
+  res.json({ groupId: generateGroupCode() });
+});
+
+// A tiny self-hosted TCP "reflector" - functionally a STUN server, but TCP.
+// Public STUN infra (Google's, etc.) is overwhelmingly UDP-only, but a NAT
+// tracks UDP and TCP port mappings completely independently - a UDP STUN
+// result tells us nothing about how the same router will map a TCP
+// connection, which is what Minecraft actually needs. So instead of relying
+// on third-party UDP STUN (or a second raw TCP port of our own, which would
+// need its own separate port-forward on top of the one this coordinator
+// already needs), a client connects here from the exact local port it's
+// about to try hole-punching with, and whatever remote address/port this
+// HTTP request arrived from IS that port's real external NAT mapping - this
+// coordinator just answers on the same port it already listens on.
+app.get('/reflect', (req, res) => {
+  let ip = req.socket.remoteAddress || '';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7); // unwrap IPv4-mapped IPv6 form
+  res.json({ ip, port: req.socket.remotePort });
+});
+
+let coordinatorVersion = '0.0.0';
+try {
+  coordinatorVersion = require('./package.json').version || coordinatorVersion;
+} catch {
+  // no package.json (unusual but survivable) - report the fallback
+}
+const startedAt = Date.now();
+
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  groups: groups.size,
+  uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+  version: coordinatorVersion,
+}));
+
+// --- Stale group cleanup (disk/memory hygiene for a long-running free deploy) ---
+//
+// Two independent sweeps, per the retention policy above: archive long-empty
+// groups' saves (move, don't delete), then separately purge anything that's
+// been sitting in trash even longer. Neither step ever touches a group/save
+// that's had anyone reconnect - restoreFromTrashIfNeeded() undoes the
+// archive step the moment that happens.
+
+function archiveStaleGroups() {
+  const now = Date.now();
+  for (const [groupId, group] of groups) {
+    if (!group.emptySince || now - group.emptySince < ARCHIVE_AFTER_MS) continue;
+
+    const livePath = path.join(SAVES_DIR, `${groupId}.zip`);
+    const trashPath = path.join(TRASH_DIR, `${groupId}.zip`);
+    if (fs.existsSync(livePath)) fs.renameSync(livePath, trashPath);
+    groups.delete(groupId); // cheap in-memory bookkeeping only - recreated instantly if anyone reconnects
+    log(`[${groupId}] empty for over ${ARCHIVE_AFTER_MS / 86400000}d - archived save to trash (not deleted)`);
+  }
+}
+
+function purgeOldTrash() {
+  const now = Date.now();
+  for (const fileName of fs.readdirSync(TRASH_DIR)) {
+    const filePath = path.join(TRASH_DIR, fileName);
+    const ageMs = now - fs.statSync(filePath).mtimeMs;
+    if (ageMs < PURGE_AFTER_MS) continue;
+    fs.unlinkSync(filePath);
+    log(`[trash] permanently deleted ${fileName} after ${(ageMs / 86400000).toFixed(0)}d in trash`);
+  }
+}
+
+// A crash between "write temp" and "rename into place" on the upload path
+// leaves a .uploading file behind; anything older than a few minutes is
+// definitely orphaned (real uploads finish in seconds), so sweep them.
+function cleanOrphanedUploadTemps() {
+  const now = Date.now();
+  for (const fileName of fs.readdirSync(SAVES_DIR)) {
+    if (!fileName.endsWith('.uploading')) continue;
+    const filePath = path.join(SAVES_DIR, fileName);
+    if (now - fs.statSync(filePath).mtimeMs > 10 * 60 * 1000) {
+      fs.unlinkSync(filePath);
+      log(`[cleanup] removed orphaned upload temp ${fileName}`);
+    }
+  }
+}
+
+function pruneMintHistory() {
+  const now = Date.now();
+  for (const [ip, times] of mintHistory) {
+    const recent = times.filter((t) => now - t < MINT_WINDOW_MS);
+    if (recent.length === 0) mintHistory.delete(ip);
+    else mintHistory.set(ip, recent);
+  }
+}
+
+setInterval(() => {
+  archiveStaleGroups();
+  purgeOldTrash();
+  cleanOrphanedUploadTemps();
+  pruneMintHistory();
+}, CLEANUP_INTERVAL_MS);
+
+// Express's default error handler answers with a full HTML error page,
+// which the mod then logs as the maximally-unhelpful
+// 'Upload response (500): <!DOCTYPE html>' - the actual cause (an EPERM
+// rename, an aborted request) never leaves the server. Log the real error
+// once, answer compact JSON.
+app.use((err, req, res, next) => {
+  log(`[http] ${req.method} ${req.path} failed: ${err.message}`);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: err.message });
+});
+
+log(githubBackup.enabled
+  ? `GitHub save backup: enabled (${process.env.GITHUB_REPO})`
+  : 'GitHub save backup: disabled (set GITHUB_TOKEN + GITHUB_REPO to survive a sleep-tier host restart)');
+
+// Restoring any previously-backed-up saves has to finish BEFORE the server
+// starts accepting requests - group.saveVersion gets seeded from whether a
+// local zip exists the moment a client first says 'hello', and that must
+// never race a still-in-progress restore.
+(async () => {
+  await githubBackup.restoreAllSaves(SAVES_DIR);
+  server.listen(PORT, () => log(`coordinator listening on :${PORT}`));
+})();
 
 module.exports = { app, server, groups };

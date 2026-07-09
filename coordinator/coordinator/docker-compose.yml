@@ -1,0 +1,10 @@
+services:
+  coordinator:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./saves:/app/saves
+    environment:
+      - PORT=8080
