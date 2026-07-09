@@ -1,31 +1,32 @@
 {
 	"schemaVersion": 1,
-	"id": "hello-migration",
+	"id": "campfire",
 	"version": "${version}",
-	"name": "Hello Migration",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "Campfire",
+	"description": "Share one Minecraft world with your friend group without anyone permanently hosting or forwarding ports - when the current host quits, hosting auto-hands-off to whoever's next, and friends reconnect automatically (direct via UPnP or hole-punching when possible, relayed otherwise).",
 	"authors": [
-		"Me!"
+		"Bilal"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"homepage": "https://github.com/bilalbelahrache-spec/host-migration",
+		"sources": "https://github.com/bilalbelahrache-spec/host-migration",
+		"issues": "https://github.com/bilalbelahrache-spec/host-migration/issues"
 	},
 	"license": "CC0-1.0",
-	"icon": "assets/hello-migration/icon.png",
+	"icon": "assets/campfire/icon.png",
 	"environment": "*",
 	"entrypoints": {
 		"main": [
-			"com.bilal.hellomigration.HelloMigration"
+			"com.bilal.campfire.Campfire"
 		],
 		"client": [
-			"com.bilal.hellomigration.client.HelloMigrationClient"
+			"com.bilal.campfire.client.CampfireClient"
 		]
 	},
 	"mixins": [
-		"hello-migration.mixins.json",
+		"campfire.mixins.json",
 		{
-			"config": "hello-migration.client.mixins.json",
+			"config": "campfire.client.mixins.json",
 			"environment": "client"
 		}
 	],

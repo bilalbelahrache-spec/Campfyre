@@ -12,13 +12,14 @@ repositories {
 	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
 	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
 	// for more information about repositories.
+	mavenCentral()
 }
 
 loom {
 	splitEnvironmentSourceSets()
 
 	mods {
-		"hello-migration" {
+		"campfire" {
 			sourceSet sourceSets.main
 			sourceSet sourceSets.client
 		}
@@ -28,6 +29,13 @@ loom {
 		client {
 			programArg "--username"
 			programArg "Player1Dev"
+			// Real installs mint a fresh, unguessable group id on first run (see
+			// CampfireClient.loadConfig/mintNewGroupId). Our two dev-test
+			// clients need to land in the SAME group instead, so they can test
+			// host migration against each other - this property makes the mod
+			// skip minting and reuse the same shared id both dev runs have
+			// always used, without changing what a real player gets by default.
+			property "campfire.sharedDevGroupId", "dev-test-group"
 		}
 
 		client2 {
@@ -37,6 +45,7 @@ loom {
 			runDir = "run2"
 			programArg "--username"
 			programArg "Player2Dev"
+			property "campfire.sharedDevGroupId", "dev-test-group"
 		}
 	}
 }
@@ -49,6 +58,20 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// UPnP IGD client (port mapping + external IP lookup) - lets a host expose
+	// their LAN Minecraft port directly to the internet without manually
+	// touching router settings, so friends can connect straight to them
+	// instead of always tunneling through the coordinator relay. Client-only:
+	// this is only ever attempted from CampfireClient, never from server code.
+	// Tiny, dependency-free, focused purely on IGD discovery/port mapping/
+	// external IP (verified against the real jar on Maven Central - not guessed).
+	clientImplementation "org.bitlet:weupnp:0.1.4"
+	// Bundles weupnp's classes directly into our built mod jar (Loom's
+	// Jar-in-Jar) - without this, a real distributed jar would crash with
+	// NoClassDefFoundError the first time UPnP mapping is attempted, since
+	// plain (non-mod) dependencies aren't on a player's classpath otherwise.
+	include "org.bitlet:weupnp:0.1.4"
 }
 
 processResources {
