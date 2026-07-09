@@ -58,14 +58,14 @@ public class CampfireCreateScreen extends Screen {
         mod.setCoordinatorHost(coordinatorField.getText());
 
         new Thread(() -> {
-            boolean ok = mod.mintNewGroupId();
+            CampfireClient.MintOutcome outcome = mod.mintNewGroupId();
             this.client.execute(() -> {
                 minting = false;
                 lightButton.active = true;
-                if (ok) {
+                if (outcome.success()) {
                     this.client.setScreen(new CampfireCodeScreen(mod, mod.getGroupId(), parent));
                 } else {
-                    setStatus("Couldn't reach the coordinator - check the address.", CampfireUi.ERROR_COLOR);
+                    setStatus(outcome.reason(), CampfireUi.ERROR_COLOR);
                 }
             });
         }, "campfire-mint").start();

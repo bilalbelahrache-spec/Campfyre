@@ -708,6 +708,21 @@ public class CampfireClient implements ClientModInitializer {
         }
     }
 
+    // What CampfireCreateScreen shows on failure. A flat boolean used to
+    // collapse every failure into one generic "check the address" message -
+    // wrong and actively misleading for a stranger who gets rate-limited or
+    // hits a busy shared coordinator, neither of which has anything to do
+    // with the address they typed. reason is null on success.
+    record MintOutcome(boolean success, String reason) {
+        static MintOutcome ok() {
+            return new MintOutcome(true, null);
+        }
+
+        static MintOutcome failed(String reason) {
+            return new MintOutcome(false, reason);
+        }
+    }
+
     // Asks the coordinator to mint a brand-new, unguessable group id - this
     // is what turns "no group configured yet" into an actual private group,
     // instead of ever silently joining some shared/guessable default. The
@@ -715,7 +730,7 @@ public class CampfireClient implements ClientModInitializer {
     // Package-private: called from CampfireSetupScreen's "Light a New
     // Campfire" button, which is responsible for showing the code on-screen
     // (CampfireCodeScreen) afterward - this method just does the network call.
-    boolean mintNewGroupId() {
+    MintOutcome mintNewGroupId() {
         try {
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(coordinatorHost + "/groups/new"))
@@ -723,9 +738,23 @@ public class CampfireClient implements ClientModInitializer {
                     .POST(HttpRequest.BodyPublishers.noBody())
                     .build();
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 429) {
+                // MintLimiter (per-IP, see limiter.js) - this address itself
+                // created several campfires recently, nothing to do with the
+                // coordinator address typed into the field above it.
+                System.out.println("[Campfire] Coordinator rate-limited this address (HTTP 429): " + response.body());
+                return MintOutcome.failed("You've created several campfires from here recently - wait a bit and try again.");
+            }
+            if (response.statusCode() >= 500) {
+                // The shared default coordinator (or anyone's self-hosted
+                // one) having trouble - a real player has no way to fix
+                // this by editing the address field, so don't tell them to.
+                System.out.println("[Campfire] Coordinator is having trouble (HTTP " + response.statusCode() + "): " + response.body());
+                return MintOutcome.failed("The coordinator is busy or having trouble right now - try again shortly.");
+            }
             if (response.statusCode() != 200) {
                 System.out.println("[Campfire] Failed to create a new group (HTTP " + response.statusCode() + ")");
-                return false;
+                return MintOutcome.failed("Couldn't reach the coordinator - check the address.");
             }
             JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
             this.groupId = json.get("groupId").getAsString();
@@ -733,10 +762,10 @@ public class CampfireClient implements ClientModInitializer {
             this.activeWorldName = null; // no world yet either - named at Create the Shared World
             persistConfig();
             System.out.println("[Campfire] Created a new group! Share this invite code with friends: " + groupId);
-            return true;
+            return MintOutcome.ok();
         } catch (IOException | InterruptedException e) {
             System.out.println("[Campfire] Failed to create a new group (is the coordinator reachable?): " + e.getMessage());
-            return false;
+            return MintOutcome.failed("Couldn't reach the coordinator - check the address.");
         }
     }
 
