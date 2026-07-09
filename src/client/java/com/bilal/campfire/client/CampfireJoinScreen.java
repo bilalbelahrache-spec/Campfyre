@@ -107,6 +107,8 @@ public class CampfireJoinScreen extends Screen {
                     this.client.setScreen(new CampfireStatusScreen(mod, parent));
                 }
                 case NOT_FOUND -> setStatus("No Campfire with that code - double-check it.", CampfireUi.ERROR_COLOR);
+                case INVALID_CODE -> setStatus("That invite code looks wrong - check you copied the whole thing.", CampfireUi.ERROR_COLOR);
+                case BUSY -> setStatus("The coordinator is busy right now - try again in a moment.", CampfireUi.ERROR_COLOR);
                 case UNREACHABLE -> setStatus("Couldn't reach the coordinator - try again.", CampfireUi.ERROR_COLOR);
             }
         });

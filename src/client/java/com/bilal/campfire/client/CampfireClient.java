@@ -809,7 +809,7 @@ public class CampfireClient implements ClientModInitializer {
         persistConfig();
     }
 
-    enum GroupLookupResult { EXISTS, NOT_FOUND, UNREACHABLE }
+    enum GroupLookupResult { EXISTS, NOT_FOUND, INVALID_CODE, BUSY, UNREACHABLE }
 
     // Checked by CampfireJoinScreen before it commits to a typed code.
     // getGroup() on the coordinator lazily creates a group on the first
@@ -831,6 +831,14 @@ public class CampfireClient implements ClientModInitializer {
                     if (response.statusCode() == 200) {
                         JsonObject json = JsonParser.parseString(response.body()).getAsJsonObject();
                         result = json.get("exists").getAsBoolean() ? GroupLookupResult.EXISTS : GroupLookupResult.NOT_FOUND;
+                    } else if (response.statusCode() == 400) {
+                        // The coordinator rejected the group id itself (bad
+                        // charset/shape) - almost always a mangled paste, not
+                        // a coordinator problem, so don't tell the player to
+                        // "try again" at the coordinator.
+                        result = GroupLookupResult.INVALID_CODE;
+                    } else if (response.statusCode() == 429 || response.statusCode() >= 500) {
+                        result = GroupLookupResult.BUSY;
                     } else {
                         result = GroupLookupResult.UNREACHABLE;
                     }
