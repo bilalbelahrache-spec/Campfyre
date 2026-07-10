@@ -19,6 +19,7 @@ import net.minecraft.registry.RegistryKeys;
 import net.minecraft.resource.DataConfiguration;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.integrated.IntegratedServer;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
 import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.Difficulty;
@@ -207,6 +208,69 @@ public class CampfireClient implements ClientModInitializer {
     private final BlockingQueue<JsonObject> saveTransferInbox = new LinkedBlockingQueue<>();
 
     private volatile String currentHostId;
+
+    // The group's original creator, from the coordinator's 'state' broadcast
+    // (see updateMemberRoster). Set once by the coordinator (whoever's hello
+    // it saw first for this group) and never changes - unlike currentHostId,
+    // which rotates every session. Null until the first 'state' arrives.
+    private volatile String ownerId;
+    private volatile String ownerName;
+
+    // Last known gamerule/difficulty/time/weather snapshot, reported by
+    // whoever's currently hosting (see sendWorldSettingsReport) and relayed
+    // back to everyone via 'state'. Lets the owner's World Settings screen
+    // show real current values even when the owner isn't the one hosting.
+    // Null until some host has reported at least once this coordinator
+    // session.
+    private volatile WorldSettingsSnapshot worldSettings;
+
+    // gamerules is keyed by GameRules.Key.getName() (e.g. "keepInventory"),
+    // matching the vanilla command name - so the wire format stays readable
+    // in logs and doesn't need a separate id scheme.
+    record WorldSettingsSnapshot(java.util.Map<String, Boolean> gamerules, String difficulty,
+                                  long timeOfDay, boolean raining, boolean thundering) {
+    }
+
+    boolean isOwner() {
+        return playerId != null && ownerId != null && playerId.equals(ownerId);
+    }
+
+    WorldSettingsSnapshot getWorldSettings() {
+        return worldSettings;
+    }
+
+    // A boolean gamerule with a human-readable label for the World Settings
+    // screen. Curated, not exhaustive: the ~14 more obscure/admin ones
+    // (logAdminCommands, reducedDebugInfo, spawnRadius,
+    // maxCommandChainLength, commandBlockOutput, sendCommandFeedback,
+    // spectatorsGenerateChunks, disableElytraMovementCheck,
+    // doLimitedCrafting, doMobLoot, doTileDrops, doEntityDrops,
+    // doPatrolSpawning, doTraderSpawning, doWardenSpawning,
+    // forgiveDeadPlayers, universalAnger) and every numeric rule
+    // (randomTickSpeed, playersSleepingPercentage, ...) are deliberately left
+    // out - a numeric rule would need a different widget entirely, and the
+    // rest aren't things a casual survival group typically wants to touch.
+    record CuratedGameRule(String label, GameRules.Key<GameRules.BooleanRule> key) {
+    }
+
+    static final java.util.List<CuratedGameRule> CURATED_GAME_RULES = java.util.List.of(
+            new CuratedGameRule("Keep Inventory", GameRules.KEEP_INVENTORY),
+            new CuratedGameRule("Mob Griefing", GameRules.DO_MOB_GRIEFING),
+            new CuratedGameRule("Mob Spawning", GameRules.DO_MOB_SPAWNING),
+            new CuratedGameRule("Natural Regeneration", GameRules.NATURAL_REGENERATION),
+            new CuratedGameRule("Daylight Cycle", GameRules.DO_DAYLIGHT_CYCLE),
+            new CuratedGameRule("Weather Cycle", GameRules.DO_WEATHER_CYCLE),
+            new CuratedGameRule("Fire Spread", GameRules.DO_FIRE_TICK),
+            new CuratedGameRule("Fall Damage", GameRules.FALL_DAMAGE),
+            new CuratedGameRule("Fire Damage", GameRules.FIRE_DAMAGE),
+            new CuratedGameRule("Drowning Damage", GameRules.DROWNING_DAMAGE),
+            new CuratedGameRule("Freeze Damage", GameRules.FREEZE_DAMAGE),
+            new CuratedGameRule("Show Death Messages", GameRules.SHOW_DEATH_MESSAGES),
+            new CuratedGameRule("Announce Advancements", GameRules.ANNOUNCE_ADVANCEMENTS),
+            new CuratedGameRule("Immediate Respawn", GameRules.DO_IMMEDIATE_RESPAWN),
+            new CuratedGameRule("Insomnia (Phantoms)", GameRules.DO_INSOMNIA),
+            new CuratedGameRule("Disable Raids", GameRules.DISABLE_RAIDS)
+    );
 
     // ---------- Live status the GUI renders (status screen, HUD, docked button dot) ----------
 
@@ -441,6 +505,7 @@ public class CampfireClient implements ClientModInitializer {
         loadConfig();
         CampfireHud.register(this);
         CampfireKeybinds.register(this);
+        CampfireZoom.register(this);
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> onClientStarted());
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> onClientJoinedWorld());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> onDisconnectedFromServer());
@@ -1233,6 +1298,15 @@ public class CampfireClient implements ClientModInitializer {
     // Sorted into queue order so index 0 is the host (or, with no host yet,
     // whoever's next in line) - screens lean on that ordering directly.
     private void updateMemberRoster(JsonObject stateJson) {
+        // Optional fields - an older coordinator simply never sends them, in
+        // which case ownerId/worldSettings just stay null (no owner-only UI
+        // shows up, same as "nothing to compare" elsewhere in this file).
+        ownerId = stateJson.has("ownerId") && !stateJson.get("ownerId").isJsonNull()
+                ? stateJson.get("ownerId").getAsString() : null;
+        ownerName = stateJson.has("ownerName") && !stateJson.get("ownerName").isJsonNull()
+                ? stateJson.get("ownerName").getAsString() : null;
+        worldSettings = parseWorldSettings(stateJson);
+
         if (!stateJson.has("members") || !stateJson.get("members").isJsonArray()) return;
 
         java.util.List<String> queueOrder = new java.util.ArrayList<>();
@@ -1282,6 +1356,33 @@ public class CampfireClient implements ClientModInitializer {
             announceRosterChanges(previous, this.members);
         }
         updateNextUpStatus(announce);
+    }
+
+    // The coordinator passes worldSettings through completely untouched (it
+    // never interprets payloads - see server.js/group.js), so this is the
+    // one place that has to be defensive about a missing/malformed snapshot:
+    // no host has reported yet this coordinator session, or an older
+    // coordinator that predates this field at all. Either way, null just
+    // means the World Settings screen shows "no data yet" instead of guessing.
+    private static WorldSettingsSnapshot parseWorldSettings(JsonObject stateJson) {
+        if (!stateJson.has("worldSettings") || !stateJson.get("worldSettings").isJsonObject()) return null;
+        try {
+            JsonObject ws = stateJson.getAsJsonObject("worldSettings");
+            java.util.Map<String, Boolean> gamerules = new java.util.HashMap<>();
+            if (ws.has("gamerules") && ws.get("gamerules").isJsonObject()) {
+                ws.getAsJsonObject("gamerules").entrySet().forEach(e ->
+                        gamerules.put(e.getKey(), e.getValue().getAsBoolean()));
+            }
+            String difficulty = ws.has("difficulty") && !ws.get("difficulty").isJsonNull()
+                    ? ws.get("difficulty").getAsString() : "NORMAL";
+            long timeOfDay = ws.has("timeOfDay") && !ws.get("timeOfDay").isJsonNull() ? ws.get("timeOfDay").getAsLong() : 0L;
+            boolean raining = ws.has("raining") && ws.get("raining").getAsBoolean();
+            boolean thundering = ws.has("thundering") && ws.get("thundering").getAsBoolean();
+            return new WorldSettingsSnapshot(gamerules, difficulty, timeOfDay, raining, thundering);
+        } catch (Exception e) {
+            System.out.println("[Campfire] Couldn't parse worldSettings from state: " + e.getMessage());
+            return null;
+        }
     }
 
     // Turns a roster change into the kind of awareness a Discord call gives
@@ -1584,11 +1685,148 @@ public class CampfireClient implements ClientModInitializer {
                     sendJson(imHosting);
                     System.out.println("[Campfire] Told coordinator we're open for business.");
                     attemptUpnpMapping();
+                    sendWorldSettingsReport(server);
                 }
             } else {
                 System.out.println("[Campfire] Server isn't an IntegratedServer - can't open to LAN this way.");
             }
         });
+    }
+
+    // Reports the current host's live gamerule/difficulty/time/weather
+    // snapshot to the coordinator, so the owner's World Settings screen shows
+    // real values even when the owner isn't the one hosting. Called right
+    // after opening to LAN, and again after applying any
+    // owner_settings_change - both callers already run this on the server
+    // thread (server.execute()), which every read here requires.
+    private void sendWorldSettingsReport(MinecraftServer server) {
+        JsonObject gamerules = new JsonObject();
+        for (CuratedGameRule rule : CURATED_GAME_RULES) {
+            gamerules.addProperty(rule.key().getName(), server.getGameRules().get(rule.key()).get());
+        }
+        var overworld = server.getOverworld();
+
+        JsonObject settings = new JsonObject();
+        settings.add("gamerules", gamerules);
+        settings.addProperty("difficulty", server.getSaveProperties().getDifficulty().name());
+        settings.addProperty("timeOfDay", overworld.getTimeOfDay());
+        settings.addProperty("raining", overworld.isRaining());
+        settings.addProperty("thundering", overworld.isThundering());
+
+        JsonObject report = new JsonObject();
+        report.addProperty("type", "world_settings_report");
+        report.add("settings", settings);
+        sendJson(report);
+    }
+
+    // Only the current host ever reaches this (the coordinator only routes
+    // owner_settings_change to whoever's hosting - see relayToHost in
+    // server.js/group.js). fromPlayerId is coordinator-stamped from the
+    // sender's own validated connection identity, so it can't be spoofed, and
+    // ownerId is coordinator-broadcast - so a message from anyone but the
+    // group's real owner is just silently ignored here, never applied.
+    private void handleOwnerSettingsChange(String fromPlayerId, String action, com.google.gson.JsonElement value) {
+        if (!isHost()) return;
+        if (ownerId == null || !ownerId.equals(fromPlayerId)) {
+            System.out.println("[Campfire] Ignoring owner_settings_change from " + fromPlayerId
+                    + " - not this group's owner (" + ownerId + ").");
+            return;
+        }
+        MinecraftServer server = MinecraftClient.getInstance().getServer();
+        if (server == null) return;
+
+        server.execute(() -> {
+            try {
+                applyOwnerSettingsChange(server, action, value);
+            } catch (Exception e) {
+                System.out.println("[Campfire] Failed to apply owner setting '" + action + "': " + e.getMessage());
+            }
+            sendWorldSettingsReport(server);
+        });
+    }
+
+    // Actually mutates the running server - always called from the server
+    // thread (handleOwnerSettingsChange's server.execute()). Every branch
+    // uses the exact same APIs vanilla's own /gamemode, /time, /weather,
+    // /difficulty and /gamerule commands use, just invoked directly instead
+    // of through the command dispatcher (which stays permanently disabled -
+    // see openToLan's hardcoded allowCommands=false in tryOpenToLan above).
+    private void applyOwnerSettingsChange(MinecraftServer server, String action, com.google.gson.JsonElement value) {
+        switch (action) {
+            case "gamemode_self" -> {
+                GameMode mode = GameMode.byName(value.getAsString(), GameMode.SURVIVAL);
+                ServerPlayerEntity owner = server.getPlayerManager().getPlayer(UUID.fromString(ownerId));
+                if (owner != null) owner.changeGameMode(mode);
+                else System.out.println("[Campfire] Owner isn't connected to this world right now - can't set their game mode.");
+            }
+            case "gamemode_all" -> {
+                GameMode mode = GameMode.byName(value.getAsString(), GameMode.SURVIVAL);
+                for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                    player.changeGameMode(mode);
+                }
+            }
+            case "time" -> server.getOverworld().setTimeOfDay("night".equals(value.getAsString()) ? 13000L : 1000L);
+            case "weather" -> {
+                var overworld = server.getOverworld();
+                switch (value.getAsString()) {
+                    case "rain" -> overworld.setWeather(0, 6000, true, false);
+                    case "thunder" -> overworld.setWeather(0, 6000, true, true);
+                    default -> overworld.setWeather(6000, 0, false, false); // "clear"
+                }
+            }
+            case "difficulty" -> {
+                try {
+                    server.setDifficulty(Difficulty.valueOf(value.getAsString()), false);
+                } catch (IllegalArgumentException e) {
+                    System.out.println("[Campfire] Unknown difficulty '" + value.getAsString() + "'");
+                }
+            }
+            case "gamerule" -> {
+                JsonObject obj = value.getAsJsonObject();
+                String ruleName = obj.get("rule").getAsString();
+                boolean enabled = obj.get("enabled").getAsBoolean();
+                CURATED_GAME_RULES.stream()
+                        .filter(r -> r.key().getName().equals(ruleName))
+                        .findFirst()
+                        .ifPresentOrElse(
+                                r -> server.getGameRules().get(r.key()).set(enabled, server),
+                                () -> System.out.println("[Campfire] Unknown gamerule '" + ruleName + "' in owner_settings_change"));
+            }
+            default -> System.out.println("[Campfire] Unknown owner_settings_change action: " + action);
+        }
+    }
+
+    // ---------- Owner-side senders: World Settings screen calls these ----------
+
+    void sendGameModeChange(boolean everyone, GameMode mode) {
+        sendOwnerSettingsChange(everyone ? "gamemode_all" : "gamemode_self", new com.google.gson.JsonPrimitive(mode.asString()));
+    }
+
+    void sendTimeChange(boolean night) {
+        sendOwnerSettingsChange("time", new com.google.gson.JsonPrimitive(night ? "night" : "day"));
+    }
+
+    void sendWeatherChange(String kind) {
+        sendOwnerSettingsChange("weather", new com.google.gson.JsonPrimitive(kind));
+    }
+
+    void sendDifficultyChange(Difficulty difficulty) {
+        sendOwnerSettingsChange("difficulty", new com.google.gson.JsonPrimitive(difficulty.name()));
+    }
+
+    void sendGameRuleChange(GameRules.Key<GameRules.BooleanRule> key, boolean enabled) {
+        JsonObject value = new JsonObject();
+        value.addProperty("rule", key.getName());
+        value.addProperty("enabled", enabled);
+        sendOwnerSettingsChange("gamerule", value);
+    }
+
+    private void sendOwnerSettingsChange(String action, com.google.gson.JsonElement value) {
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "owner_settings_change");
+        msg.addProperty("action", action);
+        msg.add("value", value);
+        sendJson(msg);
     }
 
     // UPnP discovery/mapping is blocking network I/O (SSDP multicast + SOAP
@@ -2786,6 +3024,15 @@ public class CampfireClient implements ClientModInitializer {
                     if (waitingForDirectAddress && hostDirectAddress != null && !isHost()) {
                         waitingForDirectAddress = false;
                         tryDirectConnectThenFallback(hostDirectAddress);
+                    }
+                }
+                case "owner_settings_change" -> {
+                    String fromPlayerId = json.has("fromPlayerId") && !json.get("fromPlayerId").isJsonNull()
+                            ? json.get("fromPlayerId").getAsString() : null;
+                    String action = json.has("action") && !json.get("action").isJsonNull()
+                            ? json.get("action").getAsString() : null;
+                    if (fromPlayerId != null && action != null && json.has("value")) {
+                        handleOwnerSettingsChange(fromPlayerId, action, json.get("value"));
                     }
                 }
                 case "punch_candidate" -> {

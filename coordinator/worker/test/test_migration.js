@@ -82,6 +82,8 @@ const FAKE_ZIP = Buffer.concat([
   await sleep(400);
   const bobState = bob.received.filter((m) => m.type === 'state').pop();
   check('bob sees 2 members', bobState && bobState.members.length === 2, JSON.stringify(bobState));
+  check('ownerId is alice (first hello), not bob', bobState && bobState.ownerId === 'alice', JSON.stringify(bobState));
+  check('ownerName is Alice', bobState && bobState.ownerName === 'Alice', JSON.stringify(bobState));
 
   console.log('--- status endpoint ---');
   const status = await (await fetch(`${BASE}/groups/${groupId}/status`)).json();

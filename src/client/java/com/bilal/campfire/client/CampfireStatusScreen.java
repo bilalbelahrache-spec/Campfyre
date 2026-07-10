@@ -32,6 +32,7 @@ public class CampfireStatusScreen extends Screen {
     private CampfireButton leaveButton;
     private long copiedUntilMs = 0;
     private boolean joining = false;
+    private final long openedAtMs = System.currentTimeMillis();
 
     // What the primary button should currently do - recomputed each tick,
     // consulted on press, so the press always matches the visible label.
@@ -96,11 +97,27 @@ public class CampfireStatusScreen extends Screen {
         // Reuses the parent when we were opened FROM it (its init() re-runs
         // on setScreen, so its rows/statuses refresh anyway) instead of
         // growing a chain of stacked screens.
-        this.addDrawableChild(new CampfireButton(centerX - 102, panelBottom - 26, 100, 20,
-                Text.literal("Campfires"), button -> this.client.setScreen(
-                        parent instanceof CampfireListScreen ? parent : new CampfireListScreen(mod, parent))));
-        this.addDrawableChild(new CampfireButton(centerX + 2, panelBottom - 26, 100, 20,
-                Text.literal("Close"), button -> this.close()));
+        // Owners get a third nav button here (World Settings) - everyone else
+        // keeps the original two-button 100/100 split untouched, so this
+        // never risks the layout for the overwhelming majority of players who
+        // aren't a group's owner. The three-way split (65/65/65 with 4px
+        // gaps) fits the same centerX-102..centerX+102 span the two-button
+        // row already used.
+        if (mod.isOwner()) {
+            this.addDrawableChild(new CampfireButton(centerX - 102, panelBottom - 26, 65, 20,
+                    Text.literal("Campfires"), button -> this.client.setScreen(
+                            parent instanceof CampfireListScreen ? parent : new CampfireListScreen(mod, parent))));
+            this.addDrawableChild(new CampfireButton(centerX - 33, panelBottom - 26, 65, 20,
+                    Text.literal("Settings"), button -> this.client.setScreen(new CampfireWorldSettingsScreen(mod, this))));
+            this.addDrawableChild(new CampfireButton(centerX + 36, panelBottom - 26, 65, 20,
+                    Text.literal("Close"), button -> this.close()));
+        } else {
+            this.addDrawableChild(new CampfireButton(centerX - 102, panelBottom - 26, 100, 20,
+                    Text.literal("Campfires"), button -> this.client.setScreen(
+                            parent instanceof CampfireListScreen ? parent : new CampfireListScreen(mod, parent))));
+            this.addDrawableChild(new CampfireButton(centerX + 2, panelBottom - 26, 100, 20,
+                    Text.literal("Close"), button -> this.close()));
+        }
 
         refreshDynamicWidgets();
     }
@@ -208,6 +225,8 @@ public class CampfireStatusScreen extends Screen {
             context.drawTextWithShadow(this.textRenderer, Text.literal(v),
                     panelRight - 6 - this.textRenderer.getWidth(v), panelBottom - 62, CampfireUi.MUTED_TEXT);
         }
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     private void renderConnectionLine(DrawContext context, int centerX, int y) {

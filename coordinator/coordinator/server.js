@@ -136,6 +136,20 @@ function getGroup(groupId) {
       queue: [],
       hostId: null,
       hostDirectAddress: null,
+      // The group's original creator - set once, on whichever 'hello' the
+      // coordinator sees first for this groupId, and never changed again
+      // (not even if that player leaves for good - see CampfireClient's
+      // World Settings screen, the only thing that reads this). Distinct
+      // from hostId, which rotates every session.
+      ownerId: null,
+      ownerName: null,
+      // Opaque snapshot (gamerules/difficulty/time/weather) reported by
+      // whoever's currently hosting, via 'world_settings_report' - the
+      // coordinator never interprets it, just stores and rebroadcasts, same
+      // as every other pass-through payload here. Lets the owner's settings
+      // screen show accurate current values even when the owner isn't the
+      // one hosting.
+      worldSettings: null,
       // saveVersion bookkeeping is in-memory, but the save zip itself
       // survives restarts on disk. Seed 1 when a zip exists so a client
       // comparing its own persisted "version of my local copy" against ours
@@ -185,6 +199,9 @@ function groupStateMessage(group) {
     type: 'state',
     hostId: group.hostId,
     hostDirectAddress: group.hostDirectAddress,
+    ownerId: group.ownerId,
+    ownerName: group.ownerName,
+    worldSettings: group.worldSettings,
     saveVersion: group.saveVersion,
     queue: group.queue,
     members: [...group.members.keys()].map((id) => {
@@ -381,6 +398,15 @@ wss.on('connection', (ws) => {
       group.lastSeen.delete(playerId); // they're here, not "last seen"
       group.emptySince = null;
       if (!group.queue.includes(playerId)) group.queue.push(playerId);
+      // Ownership is decided by whoever's hello the coordinator sees FIRST
+      // for this group, permanently - the mint call (POST /groups/new) has
+      // no player identity attached, and in practice the creator is always
+      // the first to say hello to their own fresh group anyway.
+      if (!group.ownerId) {
+        group.ownerId = playerId;
+        group.ownerName = group.names.get(playerId);
+        log(`[${groupId}] ${group.ownerName} is the original owner`);
+      }
 
       log(`[${groupId}] ${msg.playerName || playerId} connected`);
 
@@ -586,6 +612,32 @@ wss.on('connection', (ws) => {
     // may be answering whichever friend most recently asked. The coordinator
     // only ever passes the address string through - it never validates or
     // interprets it, same as it never inspects relay_data's payload.
+    // The current host reports its live gamerule/difficulty/time/weather
+    // snapshot after opening (and again after applying an owner_settings_change)
+    // so the owner's settings screen can show real current values even when
+    // the owner isn't the one hosting. Only the host is trusted to set this -
+    // same reasoning as direct_address above.
+    if (msg.type === 'world_settings_report') {
+      if (playerId !== group.hostId) return;
+      group.worldSettings = msg.settings || null;
+      broadcastState(group);
+      return;
+    }
+
+    // The owner asking whoever's currently hosting to change a setting
+    // (gamemode/gamerule/time/weather/difficulty). No target needed from the
+    // owner's side - same "always means the host" convention as
+    // punch_candidate/relay_* below. The coordinator doesn't check that the
+    // sender IS the owner (it never validates payloads), and doesn't need to:
+    // it stamps fromPlayerId from the connection's own validated identity, and
+    // the acting host cross-checks that against the coordinator-broadcast
+    // ownerId before applying anything - a non-owner sending this just gets
+    // ignored on the receiving end.
+    if (msg.type === 'owner_settings_change') {
+      relayToHost(group, playerId, { type: 'owner_settings_change', action: msg.action, value: msg.value });
+      return;
+    }
+
     if (msg.type === 'punch_candidate') {
       const isHost = playerId === group.hostId;
       if (isHost) {

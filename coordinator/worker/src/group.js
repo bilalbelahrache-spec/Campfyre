@@ -74,6 +74,17 @@ const DEFAULT_META = {
   hostId: null,
   hostDirectAddress: null,
   lastHostId: null,
+  // The group's original creator - set once, on whichever 'hello' this
+  // Durable Object sees first, and never changed again. Distinct from
+  // hostId, which rotates every session. See group.js's hello handler and
+  // CampfireClient's World Settings screen (the only thing that reads this).
+  ownerId: null,
+  ownerName: null,
+  // Opaque snapshot (gamerules/difficulty/time/weather) reported by
+  // whoever's currently hosting, via 'world_settings_report' - never
+  // interpreted here, just stored and rebroadcast like every other
+  // pass-through payload.
+  worldSettings: null,
   queue: [],
   names: {}, // playerId -> display name, kept after departure so reconnects stay labeled
   lastSeen: {}, // playerId -> departure timestamp; feeds the "seen 2h ago" away roster
@@ -137,6 +148,13 @@ export class CampfireGroup {
       // the STORED object as-is for any group that already has one, so a
       // field added later is simply missing rather than defaulted.
       if (!this.meta.modHashes) this.meta.modHashes = {};
+      // Same for ownerId/worldSettings: a group persisted before this
+      // shipped just has them undefined, not null - normalize so
+      // `!this.meta.ownerId` checks below behave the same for old and new
+      // groups. ownerId gets backfilled for real on the next hello.
+      if (this.meta.ownerId === undefined) this.meta.ownerId = null;
+      if (this.meta.ownerName === undefined) this.meta.ownerName = null;
+      if (this.meta.worldSettings === undefined) this.meta.worldSettings = null;
     }
     return this.meta;
   }
@@ -255,6 +273,9 @@ export class CampfireGroup {
       type: 'state',
       hostId: m.hostId,
       hostDirectAddress: m.hostDirectAddress,
+      ownerId: m.ownerId,
+      ownerName: m.ownerName,
+      worldSettings: m.worldSettings,
       saveVersion: m.saveVersion,
       queue: m.queue,
       members: [...this.members.keys()].map((id) => {
@@ -320,6 +341,15 @@ export class CampfireGroup {
       meta.emptySince = null;
       await this.setAlarmFor('purge', null);
       if (!meta.queue.includes(playerId)) meta.queue.push(playerId);
+      // Ownership is decided by whoever's hello this Durable Object sees
+      // FIRST, permanently - the mint call has no player identity attached,
+      // and in practice the creator is always the first to say hello to
+      // their own fresh group anyway.
+      if (!meta.ownerId) {
+        meta.ownerId = playerId;
+        meta.ownerName = meta.names[playerId];
+        this.log(`${meta.ownerName} is the original owner`);
+      }
       this.pruneRememberedNames();
       await this.saveMeta();
 
@@ -488,6 +518,31 @@ export class CampfireGroup {
       }
       this.send(ws, { type: 'save_download_done' });
       this.log(`save downloaded over websocket (${(save.size / 1024 / 1024).toFixed(1)} MB, v${meta.saveVersion})`);
+      return;
+    }
+
+    // The current host reports its live gamerule/difficulty/time/weather
+    // snapshot after opening (and again after applying an
+    // owner_settings_change) so the owner's settings screen can show real
+    // current values even when the owner isn't the one hosting. Only the
+    // host is trusted to set this - same as direct_address elsewhere.
+    if (msg.type === 'world_settings_report') {
+      if (playerId !== meta.hostId) return;
+      meta.worldSettings = msg.settings || null;
+      await this.saveMeta();
+      this.broadcastState();
+      return;
+    }
+
+    // The owner asking whoever's currently hosting to change a setting. No
+    // target needed from the owner's side - same "always means the host"
+    // convention as punch_candidate/relay_* below. This DO doesn't check
+    // that the sender IS the owner (it never validates payloads); it stamps
+    // fromPlayerId from the connection's own validated identity via
+    // relayToHost, and the acting host cross-checks that against the
+    // broadcast ownerId before applying anything.
+    if (msg.type === 'owner_settings_change') {
+      this.relayToHost(playerId, { type: 'owner_settings_change', action: msg.action, value: msg.value });
       return;
     }
 

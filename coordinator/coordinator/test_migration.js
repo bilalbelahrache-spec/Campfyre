@@ -4,11 +4,16 @@ const WebSocket = require('ws');
 let bobMigrated;
 const bobMigratedPromise = new Promise((r) => { bobMigrated = r; });
 
+// Last 'state' each player saw, keyed by name - used below to check ownerId
+// is stamped on Alice's own hello and never overwritten by Bob's later one.
+const lastState = {};
+
 function connect(groupId, playerId, playerName) {
   const ws = new WebSocket('ws://localhost:8080/ws');
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw.toString());
     console.log(`[${playerName}] received:`, msg);
+    if (msg.type === 'state') lastState[playerName] = msg;
     if (playerName === 'Bob' && msg.type === 'migrate') bobMigrated(msg);
   });
   return new Promise((resolve) => {
@@ -33,6 +38,13 @@ function connect(groupId, playerId, playerName) {
   console.log('\n--- Bob connects while Alice is hosting ---');
   const bob = await connect(groupId, 'bob', 'Bob');
   await new Promise((r) => setTimeout(r, 300));
+
+  if (lastState.Bob && lastState.Bob.ownerId === 'alice' && lastState.Bob.ownerName === 'Alice') {
+    console.log('\nPASS: ownerId stayed Alice (the first hello) even after Bob joined.');
+  } else {
+    console.log('\nFAIL: ownerId was', lastState.Bob && lastState.Bob.ownerId, '- expected alice.');
+    process.exitCode = 1;
+  }
 
   // Promotion is deliberately NOT immediate: the coordinator holds the
   // migration (beginPendingMigration) until Alice's save upload lands or
