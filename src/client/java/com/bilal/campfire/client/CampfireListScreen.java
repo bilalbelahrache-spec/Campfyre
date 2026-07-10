@@ -35,6 +35,7 @@ public class CampfireListScreen extends Screen {
     // every frame by render() - hence concurrent, no bouncing needed.
     private final Map<String, CampfireClient.RemoteCampfireStatus> statuses = new ConcurrentHashMap<>();
     private long lastPollMs = 0;
+    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireListScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Your Campfires"));
@@ -150,6 +151,8 @@ public class CampfireListScreen extends Screen {
                     Text.literal("+ " + (entries.size() - MAX_ROWS) + " more"),
                     panelLeft + 10, rowsTop + shown * ROW_HEIGHT + 2, CampfireUi.MUTED_TEXT);
         }
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     // The live one-liner under each campfire's name. Names come straight

@@ -23,6 +23,7 @@ public class CampfireCreateScreen extends Screen {
     private Text status = Text.empty();
     private int statusColor = CampfireUi.ERROR_COLOR;
     private volatile boolean minting = false;
+    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireCreateScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Light a New Campfire"));
@@ -102,6 +103,8 @@ public class CampfireCreateScreen extends Screen {
         if (!status.getString().isEmpty()) {
             context.drawCenteredTextWithShadow(this.textRenderer, status, centerX, panelTop + 133, statusColor);
         }
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     @Override

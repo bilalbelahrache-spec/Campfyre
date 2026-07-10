@@ -19,6 +19,7 @@ public class CampfireCodeScreen extends Screen {
     private final Screen parent;
     private CampfireButton copyButton;
     private long copiedUntilMs = 0;
+    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireCodeScreen(CampfireClient mod, String code, Screen parent) {
         super(Text.literal("Your Campfire is Lit"));
@@ -93,6 +94,8 @@ public class CampfireCodeScreen extends Screen {
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal("It's a house key - anyone holding it can join."),
                 centerX, panelTop + 94, CampfireUi.MUTED_TEXT);
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     @Override

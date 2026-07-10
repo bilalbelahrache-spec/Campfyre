@@ -3,6 +3,8 @@
 	"package": "com.bilal.campfire.client.mixin",
 	"compatibilityLevel": "JAVA_17",
 	"client": [
+		"GameRendererMixin",
+		"MouseMixin",
 		"TitleScreenMixin"
 	],
 	"injectors": {

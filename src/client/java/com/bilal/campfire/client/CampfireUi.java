@@ -233,6 +233,27 @@ public final class CampfireUi {
         context.drawBorder(left, top, right - left, bottom - top, withAlpha(ACCENT & 0xFFFFFF, 90));
     }
 
+    private static final long OPEN_FADE_MS = 160;
+
+    /**
+     * Fades a screen in from black over its first ~160ms, drawn as the very
+     * last thing in render() so it overlays panel/embers/text/widgets alike
+     * without touching any of their own draw calls or click hit-testing
+     * (this is a pure visual overlay, not a widget). Every Campfire screen
+     * stores its own {@code openedAtMs = System.currentTimeMillis()} field
+     * and passes it here - replaces the previous instant hard-cut between
+     * screens with the same "everything breathes" feel the rest of this
+     * class already has (icon flicker, ember drift, status-dot pulse).
+     */
+    static void drawOpenFade(DrawContext context, int width, int height, long openedAtMs) {
+        long elapsed = System.currentTimeMillis() - openedAtMs;
+        if (elapsed >= OPEN_FADE_MS) return;
+        float t = elapsed / (float) OPEN_FADE_MS;
+        float eased = 1.0F - (1.0F - t) * (1.0F - t);
+        int alpha = (int) (255 * (1.0F - eased));
+        context.fill(0, 0, width, height, withAlpha(0x000000, alpha));
+    }
+
     /**
      * 3x3 status dot with a soft glow. The CONNECTING color pulses so "still
      * trying" is visibly different from a settled state even out of the

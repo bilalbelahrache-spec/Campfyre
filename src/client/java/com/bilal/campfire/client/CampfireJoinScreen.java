@@ -30,6 +30,7 @@ public class CampfireJoinScreen extends Screen {
     private Text status = Text.empty();
     private int statusColor = CampfireUi.ERROR_COLOR;
     private volatile boolean checking = false;
+    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireJoinScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Join a Campfire"));
@@ -148,6 +149,8 @@ public class CampfireJoinScreen extends Screen {
         } else if (!status.getString().isEmpty()) {
             context.drawCenteredTextWithShadow(this.textRenderer, status, centerX, panelTop + 136, statusColor);
         }
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     // What the current field contents will actually DO, updated every frame:

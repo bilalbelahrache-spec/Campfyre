@@ -20,6 +20,7 @@ class CampfireWorldNameScreen extends Screen {
     private final CampfireClient mod;
     private final Screen parent;
     private TextFieldWidget nameField;
+    private final long openedAtMs = System.currentTimeMillis();
 
     CampfireWorldNameScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Name the Shared World"));
@@ -77,6 +78,8 @@ class CampfireWorldNameScreen extends Screen {
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal("Created on this computer, shared with the group."),
                 centerX, panelTop + 88, CampfireUi.MUTED_TEXT);
+
+        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     @Override
