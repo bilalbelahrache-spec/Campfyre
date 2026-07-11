@@ -70,8 +70,11 @@ final class CampfireHud {
         int boxRight = textX + textWidth + PADDING;
         int boxBottom = MARGIN + PADDING + (detail != null ? 21 : 12) + PADDING;
 
-        context.fill(MARGIN, MARGIN, boxRight, boxBottom, CampfireUi.withAlpha(0x1B1512, 150 * alpha / 255));
-        context.fill(MARGIN, MARGIN, MARGIN + 2, boxBottom, CampfireUi.withAlpha(CampfireUi.ACCENT & 0xFFFFFF, 190 * alpha / 255));
+        context.fillGradient(MARGIN, MARGIN, boxRight, boxBottom,
+                CampfireUi.withAlpha(CampfireUi.PANEL_BG_TOP & 0xFFFFFF, 150 * alpha / 255),
+                CampfireUi.withAlpha(0x1B1512, 150 * alpha / 255));
+        int stripAlpha = (int) ((160 + 90 * CampfireUi.breathe(2600)) * alpha / 255);
+        context.fill(MARGIN, MARGIN, MARGIN + 2, boxBottom, CampfireUi.withAlpha(CampfireUi.ACCENT & 0xFFFFFF, Math.min(255, stripAlpha)));
 
         // The pixel flame has no alpha channel - draw it only while the badge
         // is fully opaque so the fade reads as the card dissolving, not the

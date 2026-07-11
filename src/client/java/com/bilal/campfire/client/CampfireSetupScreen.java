@@ -20,7 +20,6 @@ public class CampfireSetupScreen extends Screen {
 
     private final CampfireClient mod;
     private final Screen parent;
-    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireSetupScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Welcome to Campfire"));
@@ -69,8 +68,6 @@ public class CampfireSetupScreen extends Screen {
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal("Got an invite? Paste it and pull up a seat."),
                 centerX, panelTop + 155, CampfireUi.MUTED_TEXT);
-
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     @Override

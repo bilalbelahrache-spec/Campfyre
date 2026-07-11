@@ -154,9 +154,17 @@ public class CampfireClient implements ClientModInitializer {
     // values that used to be hardcoded here, so an untouched config file
     // behaves exactly like before. These flat fields always describe the
     // ACTIVE campfire; the full remembered list lives in `campfires`.
-    private String coordinatorHost;
-    private String coordinatorWs;
-    private String groupId;
+    // volatile: written from the render thread (loadConfig, setCoordinatorHost,
+    // switchToCampfire, joinGroup) and read from numerous background threads
+    // (campfire-reconnect, campfire-upload, campfire-fetch-world,
+    // campfire-handoff, campfire-mint, HTTP callback threads) - every other
+    // field genuinely shared across threads in this class already is
+    // volatile (currentHostId, coordinatorStatus, knownSaveVersion, etc.);
+    // these four were the sole, unexplained exception, with no guaranteed
+    // cross-thread visibility of an update otherwise.
+    private volatile String coordinatorHost;
+    private volatile String coordinatorWs;
+    private volatile String groupId;
 
     // Every campfire this player belongs to, not just the active one - a
     // player can be in several friend groups, each with its own world and
@@ -180,9 +188,9 @@ public class CampfireClient implements ClientModInitializer {
         int localSaveVersion = 0;
     }
 
-    private WebSocket webSocket;
-    private String playerId;
-    private String playerName;
+    private volatile WebSocket webSocket;
+    private volatile String playerId;
+    private volatile String playerName;
 
     // The JDK WebSocket client allows only one sendText() in flight at a time -
     // a second call before the first's CompletableFuture completes fails that
@@ -415,7 +423,16 @@ public class CampfireClient implements ClientModInitializer {
     // for a host_direct_address broadcast before giving up and falling back
     // to the relay. Lets a direct address that arrives just barely in time
     // preempt that fallback instead of racing it.
-    private volatile boolean waitingForDirectAddress = false;
+    // Atomic (not a plain volatile boolean) on purpose: the timeout thread
+    // and the host_direct_address handler both do "if still waiting, stop
+    // waiting and act" - UPnP mapping routinely finishes right around
+    // DIRECT_ADDRESS_WAIT_MS itself (see the comment on that constant), so
+    // the message arriving within a hair of the timeout firing isn't a rare
+    // edge case. A plain read-then-write let both sides read true before
+    // either wrote false, firing a hole-punch attempt AND a direct-connect
+    // attempt at once. compareAndSet(true, false) below makes "stop
+    // waiting" a single atomic transition only one of them can win.
+    private final AtomicBoolean waitingForDirectAddress = new AtomicBoolean(false);
 
     // Bare hostname/port of the coordinator, derived from coordinatorHost in
     // loadConfig(). Used only for hole-punch reflect() calls (see
@@ -506,6 +523,7 @@ public class CampfireClient implements ClientModInitializer {
         CampfireHud.register(this);
         CampfireKeybinds.register(this);
         CampfireZoom.register(this);
+        CampfireFrameCache.register();
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> onClientStarted());
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> onClientJoinedWorld());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> onDisconnectedFromServer());
@@ -854,11 +872,18 @@ public class CampfireClient implements ClientModInitializer {
         return groupId;
     }
 
-    // Called from CampfireStatusScreen's "Leave Campfire" button. Only
-    // reachable from the title screen (no world open), so there's no save to
-    // upload here - just forget the group and disconnect, so the docked
-    // title-screen button goes back to offering "create or join" next time.
-    void leaveGroup() {
+    // Called from CampfireStatusScreen's "Leave Campfire" button. Reachable
+    // from the title screen (no world open), but a quit-time save upload or
+    // an in-flight download can still be running in the background then -
+    // both close over the live groupId/coordinatorHost fields, so forgetting
+    // the group and reassigning those out from under either one can
+    // upload/download to the wrong place. Refuses (returns false) while
+    // either is active; the caller must not navigate away in that case.
+    boolean leaveGroup() {
+        if (activeUploadThread != null || isPreparingWorld()) {
+            showMigrationToast("Still syncing this campfire", "Wait for the save transfer to finish before leaving");
+            return false;
+        }
         intentionalDisconnect = true;
         if (webSocket != null) {
             webSocket.abort();
@@ -884,6 +909,7 @@ public class CampfireClient implements ClientModInitializer {
         this.activeWorldName = null;
         awaitingHandoffSinceMs = 0;
         persistConfig();
+        return true;
     }
 
     enum GroupLookupResult { EXISTS, NOT_FOUND, INVALID_CODE, BUSY, UNREACHABLE }
@@ -964,6 +990,16 @@ public class CampfireClient implements ClientModInitializer {
         }
         if (describeHudStatus() != null) {
             showMigrationToast("Leave the world first", "Can't switch campfires mid-game");
+            return;
+        }
+        // A quit-time save upload (onServerStopped's campfire-upload thread) or an
+        // in-flight download (openManagedWorld/migrate's campfire-fetch-world /
+        // campfire-handoff threads) both close over the live groupId/coordinatorHost
+        // fields and run well after describeHudStatus() has already gone back to
+        // null - switching campfires out from under either one reassigns those
+        // fields mid-transfer and can upload/download to the wrong group's save.
+        if (activeUploadThread != null || isPreparingWorld()) {
+            showMigrationToast("Still syncing this campfire", "Wait for the save transfer to finish before switching");
             return;
         }
 
@@ -1075,6 +1111,36 @@ public class CampfireClient implements ClientModInitializer {
             System.out.println("[Campfire] Not connecting - no group id set.");
             coordinatorStatus = CoordinatorStatus.NOT_CONFIGURED;
             return;
+        }
+
+        // A caller can reach this with a PREVIOUS campfire's socket still
+        // open - joinGroup() and CampfireCodeScreen's Continue both jump
+        // straight here after just minting/joining a group, without ever
+        // tearing down whatever campfire was active before (only
+        // switchToCampfire did that cleanup). Left alive, that old socket's
+        // CoordinatorListener keeps running: every 'state' the OLD
+        // coordinator broadcasts still lands in handleMessage() and
+        // overwrites members/currentHostId/coordinatorStatus with the OLD
+        // group's data, fighting the new connection for the same shared
+        // fields. This was the "every campfire after the first just doesn't
+        // work" bug. A normal same-group reconnect after a dropped
+        // connection never reaches this branch - webSocket is already null
+        // by then (onCoordinatorConnectionLost nulls it before any retry
+        // calls back into this method).
+        if (webSocket != null) {
+            intentionalDisconnect = true;
+            webSocket.abort();
+            webSocket = null;
+            sendQueue.clear();
+            currentHostId = null;
+            members = java.util.List.of();
+            awayMembers = java.util.List.of();
+            rosterPrimed = false;
+            wasNextUp = false;
+            awaitingHandoffSinceMs = 0;
+            handoffOpenPending = false;
+            hostDirectAddress = null;
+            connectionTier = null;
         }
 
         Session session = MinecraftClient.getInstance().getSession();
@@ -1515,8 +1581,16 @@ public class CampfireClient implements ClientModInitializer {
         if (preparingWorld) return;
         preparingWorld = true;
         showMigrationToast("Getting the latest world...", "Downloading your group's newest save");
+        // Snapshot before spawning - switchToCampfire() only refuses while
+        // describeHudStatus() != null, which is false during this exact
+        // window (still on the status screen, not yet in the world), so a
+        // switch to a different campfire could otherwise reassign
+        // this.groupId while this download is still in flight and land the
+        // download/version-bump in the wrong campfire's folder. Same
+        // reasoning as the migrate handler's handoffGroupId.
+        String downloadGroupId = groupId;
         new Thread(() -> {
-            boolean downloaded = downloadCurrentSave(groupId, knownSaveVersion, null);
+            boolean downloaded = downloadCurrentSave(downloadGroupId, knownSaveVersion, null);
             preparingWorld = false;
             if (downloaded) {
                 client.execute(() -> {
@@ -1573,8 +1647,20 @@ public class CampfireClient implements ClientModInitializer {
         }
     }
 
+    // Also true while a migrate-driven handoff download is running
+    // (migrationInProgress), not just our own openManagedWorld() download
+    // (preparingWorld) - CampfireStatusScreen's primary button used to check
+    // only the latter, so while this exact player's active-handoff download
+    // was already under way, the screen still offered an ENABLED "Open the
+    // World" (isNextUp() is true throughout - currentHostId stays null by
+    // design until the incoming host actually opens to LAN). Clicking it
+    // raced a second, unrelated download/open attempt against the in-flight
+    // handoff. The swap step itself is now also hardened against that exact
+    // race (see the stopLocalServerIfRunningManagedWorld() call inside
+    // downloadCurrentSave), but not offering the button in the first place
+    // is the simpler fix at the point a player would actually see it.
     boolean isPreparingWorld() {
-        return preparingWorld;
+        return preparingWorld || migrationInProgress;
     }
 
     // "No one is hosting and we're at the front of the queue" - the state in
@@ -1653,6 +1739,7 @@ public class CampfireClient implements ClientModInitializer {
             relayHostMultiplexer.shutdownAll();
             relayHostMultiplexer = null;
             startFriendListenerIfNeeded();
+            new Thread(UpnpPortMapper::unmapPort, "campfire-upnp-unmap").start();
         }
     }
 
@@ -1912,7 +1999,7 @@ public class CampfireClient implements ClientModInitializer {
             return;
         }
 
-        waitingForDirectAddress = true;
+        waitingForDirectAddress.set(true);
         new Thread(() -> {
             try {
                 Thread.sleep(DIRECT_ADDRESS_WAIT_MS);
@@ -1920,8 +2007,7 @@ public class CampfireClient implements ClientModInitializer {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (waitingForDirectAddress) {
-                waitingForDirectAddress = false;
+            if (waitingForDirectAddress.compareAndSet(true, false)) {
                 System.out.println("[Campfire] No direct (UPnP) address from host after waiting - trying a hole-punched connection instead.");
                 attemptHolePunch();
             }
@@ -2141,11 +2227,27 @@ public class CampfireClient implements ClientModInitializer {
 
         new Thread(() -> {
             try {
+                // Bounded: if ConnectScreen.connect(...) below never actually
+                // reaches this loopback port (player backs out before it
+                // connects, or Minecraft's own connect attempt fails earlier
+                // in its own pipeline), an unbounded accept() here blocked
+                // forever - leaking this thread AND the already-punched
+                // socket/port for the rest of the session with nothing ever
+                // closing either.
+                bridgeListener.setSoTimeout(30_000);
                 java.net.Socket local = bridgeListener.accept();
                 bridgeListener.close();
                 SocketBridge.pump(local, punched, "friend");
             } catch (IOException e) {
                 System.out.println("[Campfire] Hole-punch bridge listener failed: " + e.getMessage());
+                try {
+                    bridgeListener.close();
+                } catch (IOException ignored) {
+                }
+                try {
+                    punched.close();
+                } catch (IOException ignored) {
+                }
             }
         }, "campfire-punch-bridge-accept").start();
 
@@ -2549,18 +2651,33 @@ public class CampfireClient implements ClientModInitializer {
             // and is the main thing slowing down this step. Store instead of
             // deflate so this is basically a straight copy.
             zos.setLevel(Deflater.NO_COMPRESSION);
-            Files.walk(sourceDir)
-                    .filter(Files::isRegularFile)
-                    .forEach(path -> {
-                        String entryName = sourceDir.relativize(path).toString().replace('\\', '/');
-                        try {
-                            zos.putNextEntry(new ZipEntry(entryName));
-                            Files.copy(path, zos);
-                            zos.closeEntry();
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
-                        }
-                    });
+            // Files.walk's Stream holds a native directory-traversal handle
+            // that the Javadoc requires closing - every other Files.walk in
+            // this file is try-with-resources; this one wasn't, leaking one
+            // open handle on the world save folder every upload (every host
+            // quit). On Windows a lingering handle here could make a LATER
+            // Files.move/delete of that same folder fail with a file-in-use
+            // error during a subsequent migration's backup rotation.
+            try (var walk = Files.walk(sourceDir)) {
+                walk.filter(Files::isRegularFile)
+                        .forEach(path -> {
+                            String entryName = sourceDir.relativize(path).toString().replace('\\', '/');
+                            try {
+                                zos.putNextEntry(new ZipEntry(entryName));
+                                Files.copy(path, zos);
+                                zos.closeEntry();
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        });
+            } catch (UncheckedIOException e) {
+                // Unwrap back to the checked IOException this method's own
+                // signature promises - same reasoning as deleteRecursively/
+                // extractZipToDirectory. Without this, the caller's
+                // `catch (IOException e)` around zipDirectory() doesn't
+                // catch a mid-zip file failure at all.
+                throw e.getCause();
+            }
         }
         return baos.toByteArray();
     }
@@ -2589,7 +2706,20 @@ public class CampfireClient implements ClientModInitializer {
     // got lost. So: close it first, and wait for it to actually finish before
     // downloading, so the world the new host opens next is genuinely the one
     // we just unpacked.
-    private void stopLocalServerIfRunningManagedWorld() {
+    // synchronized: this can be called from two independently-triggered
+    // background threads at once (campfire-handoff off a 'migrate', and
+    // campfire-close-fork off an 'already_hosting' error) - without a lock,
+    // both would see the server still open, both create their OWN
+    // CountDownLatch, and the second one overwrites internalRestartLatch
+    // before the first caller's onServerStopped() ever gets to count its
+    // latch down. The first caller then just times out after the full 30s
+    // waiting on a latch nobody will ever signal - not data loss, but a
+    // pointless stall on every handoff that happens to race a second one.
+    // Serializing here means a second caller simply waits its turn behind
+    // the first (which is already the only correct outcome: there's only
+    // ever one local server to close), then finds it already gone and
+    // returns immediately.
+    private synchronized void stopLocalServerIfRunningManagedWorld() {
         MinecraftServer server = MinecraftClient.getInstance().getServer();
         if (server == null || !isManagedWorld(server)) return;
 
@@ -2708,6 +2838,23 @@ public class CampfireClient implements ClientModInitializer {
                 extractZipToDirectory(zipBytes, incomingDir);
                 swapPlayerData(incomingDir, outgoingHostId, this.playerId);
 
+                // A local server for this exact world can have been opened
+                // by a DIFFERENT caller after this call already passed its
+                // own pre-download stop-check (openManagedWorld() takes the
+                // instant-open fast path with no lock involved at all when
+                // it doesn't think a download is needed) but before this
+                // call reached the swap below - worldTransferLock only
+                // serializes the swap itself, not "is a server running"
+                // against it. Re-checking here, right before the swap and
+                // still holding the lock, is what actually closes that gap:
+                // whichever caller gets here first is guaranteed nothing else
+                // can be running against worldDir by the time it moves it.
+                // (synchronized on `this`, called while already holding
+                // worldTransferLock - safe: persistConfig() a few lines
+                // below already does the same nesting, so this method never
+                // acquires these two locks in the opposite order anywhere.)
+                stopLocalServerIfRunningManagedWorld();
+
                 // Stage 2: move the live world aside as a timestamped backup,
                 // then move the verified replacement into its place. If that
                 // second move somehow fails, the backup goes straight back -
@@ -2740,6 +2887,18 @@ public class CampfireClient implements ClientModInitializer {
             }
         } catch (IOException | InterruptedException e) {
             System.out.println("[Campfire] Download failed: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        } catch (RuntimeException e) {
+            // A malformed save-transfer message (missing field, bad base64, wrong
+            // type) used to throw straight out of this method uncaught - both
+            // callers (the migrate handler's campfire-handoff thread and
+            // openManagedWorld's campfire-fetch-world thread) spawn this with no
+            // try/catch of their own, so the thread died before it could ever
+            // reset preparingWorld/migrationInProgress, permanently disabling
+            // "Open the World" with no error shown. Now it's just a failed
+            // download like any other.
+            System.out.println("[Campfire] Download failed (malformed response): " + e);
             e.printStackTrace();
             return false;
         }
@@ -2798,6 +2957,18 @@ public class CampfireClient implements ClientModInitializer {
         }
     }
 
+    // Files.walk's forEach can't propagate a checked exception through its
+    // lambda, so the standard idiom is wrapping as UncheckedIOException
+    // inside it and unwrapping right back to the checked IOException this
+    // method's own signature promises - Files.walk(...).forEach(...) inside
+    // a bare try WITHOUT this catch/unwrap (the state this was in before)
+    // lets UncheckedIOException - a RuntimeException, not an IOException -
+    // escape past every caller's existing `catch (IOException e)`
+    // (pruneOldestDirectories's own catch, and downloadCurrentSave's) with
+    // nothing to catch it. In downloadCurrentSave that meant a single
+    // failed delete (a locked file mid-cleanup - very plausible on Windows)
+    // left `preparingWorld`/`migrationInProgress` stuck true forever, with
+    // no error shown and no way to recover short of restarting the game.
     private void deleteRecursively(Path dir) throws IOException {
         if (!Files.exists(dir)) return;
         try (var walk = Files.walk(dir)) {
@@ -2808,6 +2979,8 @@ public class CampfireClient implements ClientModInitializer {
                     throw new UncheckedIOException(e);
                 }
             });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
         }
     }
 
@@ -2822,6 +2995,8 @@ public class CampfireClient implements ClientModInitializer {
                                 throw new UncheckedIOException(e);
                             }
                         });
+            } catch (UncheckedIOException e) {
+                throw e.getCause();
             }
         }
         Files.createDirectories(targetDir);
@@ -2990,6 +3165,21 @@ public class CampfireClient implements ClientModInitializer {
                 System.out.println("[Campfire] Received: " + message);
             }
 
+            try {
+                dispatchMessage(type, json);
+            } catch (RuntimeException e) {
+                // A malformed/unexpected field in an otherwise-valid JSON message
+                // (missing key, wrong type, bad base64 in relay_data, etc.) used to
+                // throw straight out of this method - which runs inside onText,
+                // BEFORE its own ws.request(1) call, so the exception silently
+                // stopped this client from ever being asked for another message
+                // until the next onError-triggered reconnect. Now it's just a
+                // dropped message: logged, connection stays alive.
+                System.out.println("[Campfire] Ignoring malformed '" + type + "' message: " + e);
+            }
+        }
+
+        private void dispatchMessage(String type, JsonObject json) {
             switch (type) {
                 case "state" -> {
                     currentHostId = (json.has("hostId") && !json.get("hostId").isJsonNull())
@@ -3021,8 +3211,7 @@ public class CampfireClient implements ClientModInitializer {
                     hostDirectAddress = (json.has("address") && !json.get("address").isJsonNull())
                             ? json.get("address").getAsString() : null;
                     System.out.println("[Campfire] Host direct address: " + (hostDirectAddress != null ? hostDirectAddress : "(none - UPnP unavailable)"));
-                    if (waitingForDirectAddress && hostDirectAddress != null && !isHost()) {
-                        waitingForDirectAddress = false;
+                    if (hostDirectAddress != null && !isHost() && waitingForDirectAddress.compareAndSet(true, false)) {
                         tryDirectConnectThenFallback(hostDirectAddress);
                     }
                 }
@@ -3098,6 +3287,20 @@ public class CampfireClient implements ClientModInitializer {
                         migrationInProgress = true;
                         showMigrationToast("Migrating world...", "Hang tight, getting things ready");
 
+                        // Snapshot which campfire this migrate is actually
+                        // FOR before spawning the thread - the lambda below
+                        // reads the bare instance field otherwise, and
+                        // switchToCampfire() (render thread, no coordination
+                        // with an in-flight handoff) can reassign
+                        // this.groupId while this thread is still running.
+                        // Scenario: quit campfire A within the active-handoff
+                        // window, switch to campfire B, and a delayed
+                        // migrate for A arrives before this thread finishes -
+                        // without the snapshot, the download/version-bump
+                        // below silently lands on B's folder and persists
+                        // A's save version into B's bookkeeping.
+                        String handoffGroupId = groupId;
+
                         // Off the websocket thread. This handler runs inside
                         // the WebSocket listener's onText, and blocking there
                         // (stopLocalServer... waits up to 30s, the download
@@ -3109,7 +3312,7 @@ public class CampfireClient implements ClientModInitializer {
                         // mid-handoff and went blind for a minute.
                         new Thread(() -> {
                             stopLocalServerIfRunningManagedWorld();
-                            boolean downloaded = downloadCurrentSave(groupId, saveVersion, previousHostId);
+                            boolean downloaded = downloadCurrentSave(handoffGroupId, saveVersion, previousHostId);
 
                             migrationInProgress = false;
                             if (downloaded) {

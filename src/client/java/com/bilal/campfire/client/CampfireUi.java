@@ -5,6 +5,7 @@ import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.RotatingCubeMapRenderer;
 import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
@@ -52,6 +53,65 @@ public final class CampfireUi {
     public static final int DOT_CONNECTING = ACCENT_BRIGHT;
     public static final int DOT_OFFLINE = 0xFFE86A6A;
     public static final int DOT_IDLE = 0xFF6E655A;
+
+    // --- v2 additions: GUI revamp ("Night by the Fire") ---------------------
+    // Same warm-amber/charcoal family as the tokens above, extended for the
+    // new shared components (CampfireScrollPane/CampfireChip/text-field
+    // framing) rather than replacing them - every existing call site above
+    // keeps compiling and looking the same family of "cozy campfire," just
+    // with richer chrome around it.
+    static final int PANEL_BG_TOP = 0xF02A2018;
+    static final int SCROLLBAR_TRACK = 0x40000000;
+    static final int SCROLLBAR_THUMB = 0xFF5C452A;
+    static final int SCROLLBAR_THUMB_HOVER = ACCENT;
+    static final int CHIP_BG = 0xFF241A10;
+    static final int CHIP_BG_ACCENT = 0xFF3A2A14;
+    static final int FOCUS_RING = ACCENT_BRIGHT;
+    static final int ROW_HOVER_BG = 0x1EFFFFFF;
+    static final int ROW_DIVIDER = 0x2AFFFFFF;
+
+    private static final long BREATHE_PERIOD_MS = 4000;
+
+    /** 0..1 sinusoidal wave, one full cycle every periodMs - the "firelight breathing" pulse. */
+    static float breathe(long periodMs) {
+        return (float) (Math.sin((System.currentTimeMillis() % periodMs) / (double) periodMs * Math.PI * 2) * 0.5 + 0.5);
+    }
+
+    // --- Easing kit: every animated value in the new components is
+    // f(elapsed/duration), never a per-frame accumulator - these turn a
+    // linear 0..1 progress into a natural-feeling curve. ---------------------
+    static float easeOutCubic(float t) {
+        float f = t - 1.0F;
+        return f * f * f + 1.0F;
+    }
+
+    static float easeOutBack(float t) {
+        float c1 = 1.70158F;
+        float c3 = c1 + 1.0F;
+        float f = t - 1.0F;
+        return 1.0F + c3 * f * f * f + c1 * f * f;
+    }
+
+    static float easeInOutQuad(float t) {
+        if (t < 0.5F) return 2.0F * t * t;
+        float f = -2.0F * t + 2.0F;
+        return 1.0F - (f * f) / 2.0F;
+    }
+
+    /** Linear 0..1 progress of `now` between startMs and startMs+durationMs, clamped. */
+    static float progress(long startMs, long durationMs, long now) {
+        if (durationMs <= 0) return 1.0F;
+        float t = (now - startMs) / (float) durationMs;
+        return Math.max(0.0F, Math.min(1.0F, t));
+    }
+
+    static float progress(long startMs, long durationMs) {
+        return progress(startMs, durationMs, System.currentTimeMillis());
+    }
+
+    static float lerp(float a, float b, float t) {
+        return a + (b - a) * t;
+    }
 
     // Same public panorama asset TitleScreen itself renders. Used instead of
     // re-rendering the live parent Screen behind our panels: parent.render()
@@ -113,12 +173,21 @@ public final class CampfireUi {
         context.fill(0, 0, width, height, 0x99000000);
     }
 
-    /** Drop shadow + flat dark card with a two-tone border + soft top sheen, drawn before any widgets/text. */
+    /**
+     * Drop shadow + flat dark card with a two-tone border + soft top sheen,
+     * drawn before any widgets/text. v2: the card itself is a subtle
+     * top-to-bottom gradient (PANEL_BG_TOP -> PANEL_BG) instead of one flat
+     * fill, and a hairline amber outline just outside the border breathes
+     * (~4s sine wave) so every panel in the mod reads as lit by the same
+     * living light source, with zero changes needed at any call site.
+     */
     static void drawPanel(DrawContext context, int left, int top, int right, int bottom) {
         context.fill(left + 3, top + 4, right + 3, bottom + 4, SHADOW);
+        int glowAlpha = 45 + (int) (35 * breathe(BREATHE_PERIOD_MS));
+        context.drawBorder(left - 4, top - 4, (right - left) + 8, (bottom - top) + 8, withAlpha(ACCENT & 0xFFFFFF, glowAlpha));
         context.fill(left - 2, top - 2, right + 2, bottom + 2, PANEL_BORDER_OUTER);
         context.fill(left - 1, top - 1, right + 1, bottom + 1, PANEL_BORDER_INNER);
-        context.fill(left, top, right, bottom, PANEL_BG);
+        context.fillGradient(left, top, right, bottom, PANEL_BG_TOP, PANEL_BG);
         context.fillGradient(left, top, right, top + (bottom - top) / 3, withAlpha(0xFFFFFF, 18), 0x00FFFFFF);
     }
 
@@ -233,27 +302,6 @@ public final class CampfireUi {
         context.drawBorder(left, top, right - left, bottom - top, withAlpha(ACCENT & 0xFFFFFF, 90));
     }
 
-    private static final long OPEN_FADE_MS = 160;
-
-    /**
-     * Fades a screen in from black over its first ~160ms, drawn as the very
-     * last thing in render() so it overlays panel/embers/text/widgets alike
-     * without touching any of their own draw calls or click hit-testing
-     * (this is a pure visual overlay, not a widget). Every Campfire screen
-     * stores its own {@code openedAtMs = System.currentTimeMillis()} field
-     * and passes it here - replaces the previous instant hard-cut between
-     * screens with the same "everything breathes" feel the rest of this
-     * class already has (icon flicker, ember drift, status-dot pulse).
-     */
-    static void drawOpenFade(DrawContext context, int width, int height, long openedAtMs) {
-        long elapsed = System.currentTimeMillis() - openedAtMs;
-        if (elapsed >= OPEN_FADE_MS) return;
-        float t = elapsed / (float) OPEN_FADE_MS;
-        float eased = 1.0F - (1.0F - t) * (1.0F - t);
-        int alpha = (int) (255 * (1.0F - eased));
-        context.fill(0, 0, width, height, withAlpha(0x000000, alpha));
-    }
-
     /**
      * 3x3 status dot with a soft glow. The CONNECTING color pulses so "still
      * trying" is visibly different from a settled state even out of the
@@ -268,5 +316,90 @@ public final class CampfireUi {
         context.fill(x - 1, y, x + 2, y + 1, withAlpha(color & 0xFFFFFF, alpha));
         context.fill(x, y - 1, x + 1, y + 2, withAlpha(color & 0xFFFFFF, alpha));
         context.fill(x, y, x + 1, y + 1, withAlpha(0xFFFFFF, Math.min(alpha, 160)));
+    }
+
+    // --- v2: small pill "chip" - host/you badges, the copy-success morph
+    // target. Not a widget - a plain draw call, so a Row lambda can place one
+    // inline without any extra bookkeeping. ---------------------------------
+    static int chipWidth(TextRenderer tr, String label) {
+        return tr.getWidth(label) + 10;
+    }
+
+    static void drawChip(DrawContext context, TextRenderer tr, String label, int x, int y, int height, int textColor, boolean accent) {
+        int width = chipWidth(tr, label);
+        context.fill(x, y, x + width, y + height, accent ? CHIP_BG_ACCENT : CHIP_BG);
+        context.drawBorder(x, y, width, height, accent
+                ? withAlpha(ACCENT & 0xFFFFFF, 170) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 160));
+        context.drawCenteredTextWithShadow(tr, Text.literal(label), x + width / 2, y + (height - tr.fontHeight) / 2, textColor);
+    }
+
+    /** Small pixel checkmark - the shape the "Copy Invite" button morphs into after a successful copy. */
+    static void drawCheckmark(DrawContext context, int x, int y, int color) {
+        context.fill(x, y + 3, x + 2, y + 5, color);
+        context.fill(x + 2, y + 5, x + 4, y + 7, color);
+        context.fill(x + 4, y + 1, x + 8, y + 5, color);
+    }
+
+    // --- v2: roster avatar. Deliberately NOT a live skin texture - roster
+    // entries are coordinator identities (they can be shown from the title
+    // screen, before the player has ever joined the shared world), so
+    // there's no guaranteed PlayerListEntry/skin to draw. A deterministic
+    // colored initial-letter medallion instead: same name always gets the
+    // same color, host gets the flame mark in place of a letter.
+    private static final int[] AVATAR_PALETTE = {
+            0xFF8B5A2B, 0xFF6E4A2E, 0xFFA9702F, 0xFF5C7A4A, 0xFF4A6B7A, 0xFF7A4A6B, 0xFF6B5F53, 0xFF8E6A3A,
+    };
+
+    private static int avatarColor(String name) {
+        return AVATAR_PALETTE[Math.floorMod(name.hashCode(), AVATAR_PALETTE.length)];
+    }
+
+    static void drawAvatar(DrawContext context, TextRenderer tr, String name, int x, int y, int size, boolean isHost, boolean glow) {
+        if (glow) {
+            int glowAlpha = 60 + (int) (50 * breathe(BREATHE_PERIOD_MS));
+            context.fill(x - 1, y - 1, x + size + 1, y + size + 1, withAlpha(ACCENT & 0xFFFFFF, glowAlpha));
+        }
+        context.fill(x, y, x + size, y + size, withAlpha(avatarColor(name), 255));
+        context.drawBorder(x, y, size, size, withAlpha(0x000000, 120));
+        if (isHost) {
+            drawCampfireIcon(context, x + (size - ICON_WIDTH) / 2, y + (size - ICON_HEIGHT) / 2);
+        } else {
+            String initial = name.isEmpty() ? "?" : name.substring(0, 1).toUpperCase(java.util.Locale.ROOT);
+            context.drawCenteredTextWithShadow(tr, Text.literal(initial), x + size / 2, y + (size - tr.fontHeight) / 2 + 1, 0xFFF2E8DC);
+        }
+    }
+
+    // --- v2: styled text field framing. Draws a dark inset box + label +
+    // amber focus ring AROUND a real TextFieldWidget rather than
+    // reimplementing text editing - the widget itself just has its own
+    // vanilla background turned off (styleTextField, called once from
+    // init()) so this frame shows through instead. -------------------------
+    static void styleTextField(TextFieldWidget field) {
+        field.setDrawsBackground(false);
+        field.setEditableColor(TEXT_COLOR);
+        field.setUneditableColor(DISABLED_TEXT);
+    }
+
+    static void drawFieldFrame(DrawContext context, TextRenderer tr, TextFieldWidget field, String label) {
+        int x = field.getX();
+        int y = field.getY();
+        int w = field.getWidth();
+        int h = field.getHeight();
+        if (label != null) {
+            context.drawTextWithShadow(tr, Text.literal(label), x, y - 11, MUTED_TEXT);
+        }
+        context.fill(x - 2, y - 2, x + w + 2, y + h + 2, INNER_BOX_BG);
+        boolean focused = field.isFocused();
+        context.drawBorder(x - 2, y - 2, w + 4, h + 4, focused
+                ? withAlpha(FOCUS_RING & 0xFFFFFF, 220) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 150));
+    }
+
+    // --- v2: scrollbar chrome shared by every CampfireScrollPane. ----------
+    static void drawScrollbarTrack(DrawContext context, int x, int y, int width, int height) {
+        context.fill(x, y, x + width, y + height, SCROLLBAR_TRACK);
+    }
+
+    static void drawScrollbarThumb(DrawContext context, int x, int y, int width, int height, boolean hovered) {
+        context.fill(x, y, x + width, y + height, hovered ? SCROLLBAR_THUMB_HOVER : SCROLLBAR_THUMB);
     }
 }

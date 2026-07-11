@@ -23,7 +23,12 @@ public class CampfireCreateScreen extends Screen {
     private Text status = Text.empty();
     private int statusColor = CampfireUi.ERROR_COLOR;
     private volatile boolean minting = false;
-    private final long openedAtMs = System.currentTimeMillis();
+    // Same reasoning as CampfireJoinScreen: mintNewGroupId()'s background
+    // thread can finish well after the player has navigated away (Back
+    // stays enabled while minting) - without this, a delayed response
+    // force-opened CampfireCodeScreen over whatever the player was doing by
+    // then, including mid-game.
+    private volatile boolean closed = false;
 
     public CampfireCreateScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Light a New Campfire"));
@@ -41,6 +46,7 @@ public class CampfireCreateScreen extends Screen {
                 Text.literal("Coordinator address"));
         coordinatorField.setMaxLength(128);
         coordinatorField.setText(mod.getCoordinatorHost());
+        CampfireUi.styleTextField(coordinatorField);
         this.addDrawableChild(coordinatorField);
         this.setInitialFocus(coordinatorField);
 
@@ -61,6 +67,7 @@ public class CampfireCreateScreen extends Screen {
         new Thread(() -> {
             CampfireClient.MintOutcome outcome = mod.mintNewGroupId();
             this.client.execute(() -> {
+                if (closed) return;
                 minting = false;
                 lightButton.active = true;
                 if (outcome.success()) {
@@ -86,6 +93,7 @@ public class CampfireCreateScreen extends Screen {
         int panelBottom = panelTop + 148;
         CampfireUi.drawPanel(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
         CampfireUi.drawEmbers(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
+        CampfireUi.drawFieldFrame(context, this.textRenderer, coordinatorField, "Coordinator address:");
         super.render(context, mouseX, mouseY, delta);
 
         CampfireUi.drawTitle(context, this.textRenderer, this.title, centerX, panelTop + 10);
@@ -96,15 +104,16 @@ public class CampfireCreateScreen extends Screen {
         CampfireUi.drawCenteredWrapped(context, this.textRenderer,
                 "Running your own coordinator? Change it below.",
                 centerX, panelTop + 44, 300, CampfireUi.MUTED_TEXT);
-        context.drawTextWithShadow(this.textRenderer,
-                Text.literal("Coordinator address:"),
-                centerX - 120, panelTop + 63, CampfireUi.TEXT_COLOR);
 
         if (!status.getString().isEmpty()) {
             context.drawCenteredTextWithShadow(this.textRenderer, status, centerX, panelTop + 133, statusColor);
         }
+    }
 
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
+    @Override
+    public void removed() {
+        closed = true;
+        super.removed();
     }
 
     @Override

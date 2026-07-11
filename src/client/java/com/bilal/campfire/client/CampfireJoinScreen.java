@@ -30,7 +30,13 @@ public class CampfireJoinScreen extends Screen {
     private Text status = Text.empty();
     private int statusColor = CampfireUi.ERROR_COLOR;
     private volatile boolean checking = false;
-    private final long openedAtMs = System.currentTimeMillis();
+    // mod.checkGroupExists's callback can land well after the request was
+    // fired (up to its own HTTP timeout) - without this, pressing Join then
+    // navigating away before the response arrives (Back is never disabled
+    // while checking) let a long-delayed response silently swap the active
+    // campfire config and force this screen open again over whatever the
+    // player is doing by then, including mid-game.
+    private volatile boolean closed = false;
 
     public CampfireJoinScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Join a Campfire"));
@@ -48,6 +54,8 @@ public class CampfireJoinScreen extends Screen {
                 Text.literal("Invite code"));
         // Room for the composite "CODE@host:port" form, not just a bare code.
         codeField.setMaxLength(160);
+        codeField.setPlaceholder(Text.literal("CODE@host:port"));
+        CampfireUi.styleTextField(codeField);
         this.addDrawableChild(codeField);
         this.setInitialFocus(codeField);
 
@@ -100,6 +108,7 @@ public class CampfireJoinScreen extends Screen {
         joinButton.active = false;
         setStatus("", CampfireUi.TEXT_COLOR);
         mod.checkGroupExists(invite.code(), result -> {
+            if (closed) return;
             checking = false;
             joinButton.active = true;
             switch (result) {
@@ -129,6 +138,7 @@ public class CampfireJoinScreen extends Screen {
         int panelBottom = panelTop + 148;
         CampfireUi.drawPanel(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
         CampfireUi.drawEmbers(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
+        CampfireUi.drawFieldFrame(context, this.textRenderer, codeField, null);
         super.render(context, mouseX, mouseY, delta);
 
         CampfireUi.drawTitle(context, this.textRenderer, this.title, centerX, panelTop + 10);
@@ -149,8 +159,6 @@ public class CampfireJoinScreen extends Screen {
         } else if (!status.getString().isEmpty()) {
             context.drawCenteredTextWithShadow(this.textRenderer, status, centerX, panelTop + 136, statusColor);
         }
-
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     // What the current field contents will actually DO, updated every frame:
@@ -173,8 +181,12 @@ public class CampfireJoinScreen extends Screen {
             return;
         }
 
+        // codeField allows up to 160 chars (room for a composite invite) and
+        // this echoes back whatever was typed/pasted verbatim - unlike the
+        // "Coordinator: ..." line right below, this one had no trim, so any
+        // long paste (garbage, a mis-copied paragraph) overflowed the panel.
         context.drawCenteredTextWithShadow(this.textRenderer,
-                Text.literal("Code: " + invite.code()),
+                Text.literal(this.textRenderer.trimToWidth("Code: " + invite.code(), 300)),
                 centerX, y, CampfireUi.SUCCESS_COLOR);
         String where;
         int whereColor;
@@ -192,6 +204,17 @@ public class CampfireJoinScreen extends Screen {
         // than wrap here, this line sits right above the buttons.
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal(this.textRenderer.trimToWidth(where, 300)), centerX, y + 12, whereColor);
+    }
+
+    @Override
+    public void removed() {
+        // Fires whenever this screen stops being the active one, however
+        // that happens (explicit close(), or setScreen swapping to a
+        // completely different screen) - the one universal hook for "a
+        // still-in-flight checkGroupExists callback landing after this
+        // point must not act."
+        closed = true;
+        super.removed();
     }
 
     @Override

@@ -33,12 +33,18 @@ public class CampfireWorldSettingsScreen extends Screen {
     private static final int PANEL_HALF_WIDTH = 180;
     private static final int ROW_WIDTH = 340;
     private static final int ITEM_HEIGHT = 24;
+    // Desired height at generous window sizes, clamped for smaller ones -
+    // pre-existing bug found via the GUI revamp's screenshot self-test: a
+    // fixed 280 panel centered on the LOGICAL screen height overflows at the
+    // common default window size (854x480 -> logical 240 at GUI scale 2),
+    // clipping the title clean off the top.
+    private static final int DESIRED_PANEL_HEIGHT = 280;
+    private static final int MIN_PANEL_HEIGHT = 170;
 
     private final CampfireClient mod;
     private final Screen parent;
     private SettingsList list;
     private boolean builtWithSomeoneHosting;
-    private final long openedAtMs = System.currentTimeMillis();
 
     public CampfireWorldSettingsScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("World Settings"));
@@ -46,15 +52,19 @@ public class CampfireWorldSettingsScreen extends Screen {
         this.parent = parent;
     }
 
+    private int panelHeight() {
+        return Math.max(MIN_PANEL_HEIGHT, Math.min(DESIRED_PANEL_HEIGHT, this.height - 20));
+    }
+
     private int panelTop() {
-        return this.height / 2 - 140;
+        return this.height / 2 - panelHeight() / 2;
     }
 
     @Override
     protected void init() {
         int centerX = this.width / 2;
         int panelTop = panelTop();
-        int panelBottom = panelTop + 280;
+        int panelBottom = panelTop + panelHeight();
 
         builtWithSomeoneHosting = mod.isSomeoneHosting();
         if (builtWithSomeoneHosting) {
@@ -95,7 +105,7 @@ public class CampfireWorldSettingsScreen extends Screen {
 
         int centerX = this.width / 2;
         int panelTop = panelTop();
-        int panelBottom = panelTop + 280;
+        int panelBottom = panelTop + panelHeight();
         CampfireUi.drawPanel(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
         CampfireUi.drawEmbers(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
         super.render(context, mouseX, mouseY, delta);
@@ -108,8 +118,6 @@ public class CampfireWorldSettingsScreen extends Screen {
                     "No one's hosting right now - open the world to change settings.",
                     centerX, panelTop + 90, 300, CampfireUi.MUTED_TEXT);
         }
-
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     // ---------- The scrollable row list ----------
@@ -219,9 +227,13 @@ public class CampfireWorldSettingsScreen extends Screen {
                 if (header) {
                     context.drawCenteredTextWithShadow(tr, Text.literal(label), x + entryWidth / 2,
                             y + entryHeight / 2 - 4, CampfireUi.ACCENT_BRIGHT);
+                    CampfireUi.drawDivider(context, x + entryWidth / 2, y + entryHeight - 3, entryWidth - 20);
                     return;
                 }
 
+                if (hovered) {
+                    context.fill(x - 4, y, x + entryWidth, y + entryHeight - 1, CampfireUi.ROW_HOVER_BG);
+                }
                 context.drawTextWithShadow(tr, Text.literal(label), x, y + entryHeight / 2 - 4, CampfireUi.TEXT_COLOR);
 
                 int bx = x + entryWidth;

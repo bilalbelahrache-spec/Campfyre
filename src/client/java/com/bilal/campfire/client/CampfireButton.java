@@ -28,6 +28,16 @@ public class CampfireButton extends ButtonWidget {
         this.statusDotColor = colorSupplier;
     }
 
+    // v2: the "Copy Invite" buttons morph their flame icon into a checkmark
+    // for a moment after a successful copy - same button, same label swap
+    // that already existed, just a clearer success icon instead of "trust
+    // the text changed."
+    private boolean showCheckmark = false;
+
+    public void setShowCheckmark(boolean showCheckmark) {
+        this.showCheckmark = showCheckmark;
+    }
+
     public CampfireButton(int x, int y, int width, int height, Text message, PressAction onPress) {
         this(x, y, width, height, message, onPress, Style.TEXT);
     }
@@ -96,7 +106,11 @@ public class CampfireButton extends ButtonWidget {
                 int gap = 5;
                 int totalWidth = CampfireUi.ICON_WIDTH + gap + textWidth;
                 int startX = x + (w - totalWidth) / 2;
-                CampfireUi.drawCampfireIcon(context, startX, y + (h - CampfireUi.ICON_HEIGHT) / 2);
+                if (showCheckmark) {
+                    CampfireUi.drawCheckmark(context, startX, y + (h - CampfireUi.ICON_HEIGHT) / 2, CampfireUi.SUCCESS_COLOR);
+                } else {
+                    CampfireUi.drawCampfireIcon(context, startX, y + (h - CampfireUi.ICON_HEIGHT) / 2);
+                }
                 context.drawTextWithShadow(tr, getMessage(), startX + CampfireUi.ICON_WIDTH + gap,
                         y + (h - tr.fontHeight) / 2, textColor);
             }

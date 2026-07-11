@@ -52,8 +52,9 @@ public class CampfireCodeScreen extends Screen {
     @Override
     public void tick() {
         super.tick();
-        copyButton.setMessage(Text.literal(
-                System.currentTimeMillis() < copiedUntilMs ? "Copied!" : "Copy Invite"));
+        boolean copied = System.currentTimeMillis() < copiedUntilMs;
+        copyButton.setMessage(Text.literal(copied ? "Copied!" : "Copy Invite"));
+        copyButton.setShowCheckmark(copied);
     }
 
     private void onContinue() {
@@ -82,20 +83,50 @@ public class CampfireCodeScreen extends Screen {
                 centerX, panelTop + 32, CampfireUi.TEXT_COLOR);
 
         // The invite gets a proper showcase box - it's the single most
-        // important string this mod ever shows anyone.
-        CampfireUi.drawInnerBox(context, centerX - 130, panelTop + 46, centerX + 130, panelTop + 84);
+        // important string this mod ever shows anyone. "Ignition": the box
+        // lands with a small easeOutBack bounce and a one-shot spark burst
+        // radiating from its center, instead of just appearing - it's the
+        // one moment in the whole mod worth making a small deal of.
+        float ignition = CampfireUi.easeOutBack(CampfireUi.progress(openedAtMs, 260));
+        int slideY = (int) ((1.0F - ignition) * 14);
+
+        CampfireUi.drawInnerBox(context, centerX - 130, panelTop + 46 + slideY, centerX + 130, panelTop + 84 + slideY);
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal(code).formatted(Formatting.BOLD),
-                centerX, panelTop + 54, CampfireUi.TITLE_COLOR);
+                centerX, panelTop + 54 + slideY, CampfireUi.TITLE_COLOR);
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal(this.textRenderer.trimToWidth(mod.getInviteCode(), 250)),
-                centerX, panelTop + 69, CampfireUi.MUTED_TEXT);
+                centerX, panelTop + 69 + slideY, CampfireUi.MUTED_TEXT);
+        renderIgnitionSparks(context, centerX, panelTop + 65);
 
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal("It's a house key - anyone holding it can join."),
                 centerX, panelTop + 94, CampfireUi.MUTED_TEXT);
+    }
 
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
+    // One-shot spark burst radiating from the invite box's center for the
+    // first ~500ms this screen is open - deterministic from openedAtMs (a
+    // per-spark seed decides its angle/distance/color), so it never needs
+    // per-frame state and, like every other animation in this mod, is just
+    // f(now - openedAtMs).
+    private static final int IGNITION_SPARK_COUNT = 10;
+    private static final long IGNITION_SPARK_MS = 500;
+
+    private void renderIgnitionSparks(DrawContext context, int centerX, int centerY) {
+        long elapsed = System.currentTimeMillis() - openedAtMs;
+        if (elapsed >= IGNITION_SPARK_MS) return;
+        float t = elapsed / (float) IGNITION_SPARK_MS;
+        for (int i = 0; i < IGNITION_SPARK_COUNT; i++) {
+            int seed = (i * 0x9E3779B9) >>> 8;
+            double angle = (seed % 360) * Math.PI / 180.0;
+            double distance = t * (18 + (seed % 16));
+            int x = centerX + (int) Math.round(Math.cos(angle) * distance);
+            int y = centerY - (int) Math.round(Math.abs(Math.sin(angle)) * distance) - (int) (t * 8);
+            int alpha = (int) (210 * (1.0F - t));
+            if (alpha <= 8) continue;
+            int color = (i % 2 == 0) ? CampfireUi.ACCENT_BRIGHT : CampfireUi.ACCENT;
+            context.fill(x, y, x + 1, y + 1, CampfireUi.withAlpha(color & 0xFFFFFF, alpha));
+        }
     }
 
     @Override

@@ -45,11 +45,13 @@ class CampfireToast implements Toast {
 
     @Override
     public Visibility draw(DrawContext context, ToastManager manager, long startTime) {
-        // Card: flat dark panel with the two-tone border and an accent strip
+        // Card: gradient dark panel (same top-lit look as every screen's
+        // panel now) with the two-tone border and a breathing accent strip
         // down the left edge, echoing CampfireButton's hover accent.
-        context.fill(0, 0, WIDTH, HEIGHT, CampfireUi.PANEL_BG);
+        context.fillGradient(0, 0, WIDTH, HEIGHT, CampfireUi.PANEL_BG_TOP, CampfireUi.PANEL_BG);
         context.drawBorder(0, 0, WIDTH, HEIGHT, CampfireUi.PANEL_BORDER_INNER);
-        context.fill(1, 1, 3, HEIGHT - 1, CampfireUi.ACCENT);
+        int stripAlpha = 200 + (int) (55 * CampfireUi.breathe(2600));
+        context.fill(1, 1, 3, HEIGHT - 1, CampfireUi.withAlpha(CampfireUi.ACCENT & 0xFFFFFF, Math.min(255, stripAlpha)));
         context.fillGradient(1, 1, WIDTH - 1, HEIGHT / 2, CampfireUi.withAlpha(0xFFFFFF, 14), 0x00FFFFFF);
 
         CampfireUi.drawCampfireIcon(context, 7, (HEIGHT - CampfireUi.ICON_HEIGHT) / 2);

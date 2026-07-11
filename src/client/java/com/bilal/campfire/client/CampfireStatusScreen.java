@@ -5,6 +5,7 @@ import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.text.Text;
 
+import java.util.ArrayList;
 import java.util.List;
 
 // Opened from the docked title-screen "Campfire" button when a group is
@@ -21,8 +22,17 @@ import java.util.List;
 public class CampfireStatusScreen extends Screen {
 
     private static final int PANEL_HALF_WIDTH = 170;
-    private static final int PANEL_HEIGHT = 208;
-    private static final int MAX_ROSTER_ROWS = 5;
+    // Desired height at generous window sizes, clamped down for smaller
+    // ones - at the common default window (854x480), Minecraft's "Auto" GUI
+    // scale picks scale 2, giving a LOGICAL height of only 240. A fixed
+    // 280 panel centered on that overflows both above and below the visible
+    // area, clipping the title clean off the top (caught via the GUI
+    // self-test screenshots, not a live game launch). Every panel-height
+    // screen in this revamp clamps against the real available height instead
+    // of assuming a tall window.
+    private static final int DESIRED_PANEL_HEIGHT = 280;
+    private static final int MIN_PANEL_HEIGHT = 190;
+    private static final int ROSTER_ROW_HEIGHT = 20;
 
     private final CampfireClient mod;
     private final Screen parent;
@@ -30,9 +40,21 @@ public class CampfireStatusScreen extends Screen {
     private CampfireButton copyButton;
     private CampfireButton primaryButton;
     private CampfireButton leaveButton;
+    private CampfireScrollPane roster;
     private long copiedUntilMs = 0;
     private boolean joining = false;
-    private final long openedAtMs = System.currentTimeMillis();
+    // connectToHostNow's tiered connect (direct/UPnP -> hole-punch -> relay)
+    // has no success/failure callback this screen can observe - a failure
+    // only ever surfaces as a toast (relay_error/no_host) per src/CLAUDE.md,
+    // never a state change this screen would see. Without a ceiling, a
+    // failed attempt left `joining` stuck true forever - the primary button
+    // permanently disabled on "Connecting..." until the screen was fully
+    // closed and reopened (a fresh instance defaults joining back to
+    // false), with no indication that's what was needed. Generous upper
+    // bound above the whole tiered chain's realistic worst case (12s direct
+    // wait + hole-punch attempt + relay fallback).
+    private static final long JOINING_TIMEOUT_MS = 40_000;
+    private long joiningStartedMs = 0;
 
     // What the primary button should currently do - recomputed each tick,
     // consulted on press, so the press always matches the visible label.
@@ -60,15 +82,19 @@ public class CampfireStatusScreen extends Screen {
         return name.length() > 28 ? name.substring(0, 27) + "..." : name;
     }
 
+    private int panelHeight() {
+        return Math.max(MIN_PANEL_HEIGHT, Math.min(DESIRED_PANEL_HEIGHT, this.height - 20));
+    }
+
     private int panelTop() {
-        return this.height / 2 - PANEL_HEIGHT / 2;
+        return this.height / 2 - panelHeight() / 2;
     }
 
     @Override
     protected void init() {
         int centerX = this.width / 2;
         int panelTop = panelTop();
-        int panelBottom = panelTop + PANEL_HEIGHT;
+        int panelBottom = panelTop + panelHeight();
 
         // Copies the composite invite ("CODE@host:port") - the bare code
         // alone can't get a fresh install pointed at the right coordinator.
@@ -76,18 +102,27 @@ public class CampfireStatusScreen extends Screen {
                 Text.literal("Copy Invite"), button -> {
                     this.client.keyboard.setClipboard(mod.getInviteCode());
                     copiedUntilMs = System.currentTimeMillis() + 1500;
-                }));
+                }, true));
 
         primaryButton = this.addDrawableChild(new CampfireButton(centerX - 150, panelBottom - 50, 194, 20,
                 Text.literal("..."), button -> onPrimary(), true));
 
         leaveButton = this.addDrawableChild(new CampfireButton(centerX + 52, panelBottom - 50, 98, 20,
                 Text.literal("Leave"), button -> {
-                    mod.leaveGroup();
-                    this.client.setScreen(new TitleScreen());
+                    if (mod.leaveGroup()) {
+                        this.client.setScreen(new TitleScreen());
+                    }
                 }));
         leaveButton.setTooltip(net.minecraft.client.gui.tooltip.Tooltip.of(
                 Text.literal("Forget this Campfire on this computer. The world and your friends' access stay untouched.")));
+
+        // v2: the roster is a real CampfireScrollPane now - no more
+        // MAX_ROSTER_ROWS cap / "+N more" cutoff, a group of any size can be
+        // scrolled through in full.
+        int rosterTop = panelTop + 99;
+        int rosterBottom = panelBottom - 70;
+        roster = this.addDrawableChild(new CampfireScrollPane(centerX - 150, rosterTop, 300, rosterBottom - rosterTop,
+                null, this::buildRosterRows));
 
         // The "Campfires" nav button is always offered, not just once there
         // are already several - it's also the only way to ADD a second one
@@ -126,16 +161,22 @@ public class CampfireStatusScreen extends Screen {
     public void tick() {
         super.tick();
         refreshDynamicWidgets();
+        if (roster != null) roster.refresh();
     }
 
     private void refreshDynamicWidgets() {
-        copyButton.setMessage(Text.literal(
-                System.currentTimeMillis() < copiedUntilMs ? "Copied!" : "Copy Invite"));
+        boolean copied = System.currentTimeMillis() < copiedUntilMs;
+        copyButton.setMessage(Text.literal(copied ? "Copied!" : "Copy Invite"));
+        copyButton.setShowCheckmark(copied);
 
         CampfireClient.CoordinatorStatus status = mod.getStatus();
         String inWorldStatus = mod.describeHudStatus();
+        if (joining && System.currentTimeMillis() - joiningStartedMs > JOINING_TIMEOUT_MS) {
+            joining = false;
+        }
         if (inWorldStatus != null) {
             primaryAction = PrimaryAction.IN_WORLD;
+            joining = false;
         } else if (joining) {
             primaryAction = PrimaryAction.CONNECTING;
         } else if (status != CampfireClient.CoordinatorStatus.CONNECTED) {
@@ -189,6 +230,7 @@ public class CampfireStatusScreen extends Screen {
                 // UPnP -> hole-punch -> relay) in the background and swaps
                 // to the connect screen itself when it's ready.
                 joining = true;
+                joiningStartedMs = System.currentTimeMillis();
                 mod.connectToHostNow();
             }
             default -> {
@@ -203,7 +245,7 @@ public class CampfireStatusScreen extends Screen {
 
         int centerX = this.width / 2;
         int panelTop = panelTop();
-        int panelBottom = panelTop + PANEL_HEIGHT;
+        int panelBottom = panelTop + panelHeight();
         int panelLeft = centerX - PANEL_HALF_WIDTH;
         int panelRight = centerX + PANEL_HALF_WIDTH;
         CampfireUi.drawPanel(context, panelLeft, panelTop, panelRight, panelBottom);
@@ -215,7 +257,7 @@ public class CampfireStatusScreen extends Screen {
 
         renderConnectionLine(context, centerX, panelTop + 30);
         renderInviteBox(context, centerX, panelTop + 42);
-        renderRoster(context, centerX, panelTop + 84);
+        renderRosterHeader(context, centerX, panelTop + 84);
 
         // Quiet provenance corner: which save generation the coordinator
         // holds - handy when someone asks "did my last session upload?"
@@ -225,8 +267,6 @@ public class CampfireStatusScreen extends Screen {
             context.drawTextWithShadow(this.textRenderer, Text.literal(v),
                     panelRight - 6 - this.textRenderer.getWidth(v), panelBottom - 62, CampfireUi.MUTED_TEXT);
         }
-
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     private void renderConnectionLine(DrawContext context, int centerX, int y) {
@@ -269,93 +309,140 @@ public class CampfireStatusScreen extends Screen {
         CampfireUi.drawInnerBox(context, boxLeft, top, boxRight, top + 34);
 
         int boxCenter = (boxLeft + boxRight) / 2;
+        // isValidGroupId allows up to 64 chars on both coordinators; normal
+        // minted codes are 10, but a hand-edited campfire.json (an
+        // explicitly accepted, un-gated path) can set a longer one, and any
+        // joiner of that group lands on this exact screen - trim the same
+        // way the composite invite line right below already does.
+        String groupIdLabel = this.textRenderer.trimToWidth(mod.getGroupId(), boxRight - boxLeft - 8);
         context.drawCenteredTextWithShadow(this.textRenderer,
-                Text.literal(mod.getGroupId()).formatted(net.minecraft.util.Formatting.BOLD),
+                Text.literal(groupIdLabel).formatted(net.minecraft.util.Formatting.BOLD),
                 boxCenter, top + 6, CampfireUi.TITLE_COLOR);
         String composite = this.textRenderer.trimToWidth(mod.getInviteCode(), boxRight - boxLeft - 8);
         context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(composite),
                 boxCenter, top + 19, CampfireUi.MUTED_TEXT);
     }
 
-    private void renderRoster(DrawContext context, int centerX, int top) {
-        int left = centerX - 150;
-        int right = centerX + 150;
+    private void renderRosterHeader(DrawContext context, int centerX, int top) {
         List<CampfireClient.GroupMember> members = mod.getMembers();
-
         String header = "Around the fire" + (members.isEmpty() ? "" : " (" + members.size() + ")");
-        context.drawTextWithShadow(this.textRenderer, Text.literal(header), left, top, CampfireUi.TITLE_COLOR);
+        context.drawTextWithShadow(this.textRenderer, Text.literal(header), centerX - 150, top, CampfireUi.TITLE_COLOR);
         CampfireUi.drawDivider(context, centerX, top + 10, 300);
+    }
 
-        int y = top + 15;
+    // v2: builds the CampfireScrollPane's row list fresh every tick (see
+    // roster.refresh() in tick()) - no MAX_ROSTER_ROWS cap or "+N more"
+    // cutoff anymore, a group of any size scrolls in full instead.
+    private List<CampfireScrollPane.Row> buildRosterRows() {
+        List<CampfireScrollPane.Row> rows = new ArrayList<>();
         if (mod.getStatus() != CampfireClient.CoordinatorStatus.CONNECTED) {
-            context.drawTextWithShadow(this.textRenderer,
-                    Text.literal("Roster unavailable while offline."), left + 4, y, CampfireUi.MUTED_TEXT);
-            return;
+            rows.add(infoRow("Roster unavailable while offline."));
+            return rows;
         }
-        if (members.isEmpty()) {
-            context.drawTextWithShadow(this.textRenderer,
-                    Text.literal("Just you so far - send that invite!"), left + 4, y, CampfireUi.MUTED_TEXT);
-            return;
-        }
-
-        int shown = Math.min(members.size(), MAX_ROSTER_ROWS);
-        for (int i = 0; i < shown; i++) {
-            CampfireClient.GroupMember m = members.get(i);
-            int x = left + 4;
-            if (m.host()) {
-                CampfireUi.drawCampfireIcon(context, x, y - 1);
-            }
-            String name = m.name() + (m.you() ? " (you)" : "");
-            context.drawTextWithShadow(this.textRenderer, Text.literal(name), x + CampfireUi.ICON_WIDTH + 5, y,
-                    m.you() ? CampfireUi.ACCENT_BRIGHT : CampfireUi.TEXT_COLOR);
-
-            // A mod-list mismatch takes priority over the usual host/next-up
-            // tag - hosting can rotate to ANY player here, so catching a
-            // mismatch before it lands on someone as host matters more than
-            // the routine roster state.
-            String tag;
-            int tagColor;
-            if (m.modMismatch()) {
-                tag = "mods differ";
-                tagColor = CampfireUi.ERROR_COLOR;
-            } else if (m.host()) {
-                tag = "hosting";
-                tagColor = CampfireUi.ACCENT;
-            } else if (i == 0 && !mod.isSomeoneHosting()) {
-                tag = "next up";
-                tagColor = CampfireUi.MUTED_TEXT;
-            } else {
-                tag = null;
-                tagColor = CampfireUi.MUTED_TEXT;
-            }
-            if (tag != null) {
-                context.drawTextWithShadow(this.textRenderer, Text.literal(tag),
-                        right - 4 - this.textRenderer.getWidth(tag), y, tagColor);
-            }
-            y += 12;
-        }
-        if (members.size() > MAX_ROSTER_ROWS) {
-            context.drawTextWithShadow(this.textRenderer,
-                    Text.literal("+ " + (members.size() - MAX_ROSTER_ROWS) + " more"),
-                    left + 4, y, CampfireUi.MUTED_TEXT);
-            return;
-        }
-
-        // Friends the coordinator remembers who aren't online right now fill
-        // whatever row budget the online list didn't use - greyed out, with
-        // a "seen 2h ago" style tag. Makes the group read as a persistent
-        // circle of friends instead of only whoever's connected this second.
+        List<CampfireClient.GroupMember> members = mod.getMembers();
         List<CampfireClient.AwayMember> away = mod.getAwayMembers();
-        int awayRows = Math.min(away.size(), MAX_ROSTER_ROWS - shown);
-        for (int i = 0; i < awayRows; i++) {
-            CampfireClient.AwayMember a = away.get(i);
-            context.drawTextWithShadow(this.textRenderer, Text.literal(a.name()),
-                    left + 4 + CampfireUi.ICON_WIDTH + 5, y, CampfireUi.MUTED_TEXT);
-            String tag = describeLastSeen(a.lastSeenMs());
-            context.drawTextWithShadow(this.textRenderer, Text.literal(tag),
-                    right - 4 - this.textRenderer.getWidth(tag), y, CampfireUi.MUTED_TEXT);
-            y += 12;
+        if (members.isEmpty() && away.isEmpty()) {
+            rows.add(infoRow("Just you so far - send that invite!"));
+            return rows;
         }
+
+        boolean someoneHosting = mod.isSomeoneHosting();
+        for (int i = 0; i < members.size(); i++) {
+            rows.add(memberRow(members.get(i), i == 0 && !someoneHosting));
+        }
+        // Friends the coordinator remembers who aren't online right now -
+        // greyed out, with a "seen 2h ago" style tag. Makes the group read
+        // as a persistent circle of friends instead of only whoever's
+        // connected this second.
+        for (CampfireClient.AwayMember a : away) {
+            rows.add(awayRow(a));
+        }
+        return rows;
+    }
+
+    private CampfireScrollPane.Row infoRow(String text) {
+        return new CampfireScrollPane.Row() {
+            @Override
+            public int height() {
+                return ROSTER_ROW_HEIGHT;
+            }
+
+            @Override
+            public void render(DrawContext context, int x, int y, int width, int mouseX, int mouseY, boolean hovered, float delta) {
+                context.drawTextWithShadow(textRenderer, Text.literal(text),
+                        x + 4, y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);
+            }
+        };
+    }
+
+    private CampfireScrollPane.Row memberRow(CampfireClient.GroupMember m, boolean nextUp) {
+        return new CampfireScrollPane.Row() {
+            @Override
+            public int height() {
+                return ROSTER_ROW_HEIGHT;
+            }
+
+            @Override
+            public void render(DrawContext context, int x, int y, int width, int mouseX, int mouseY, boolean hovered, float delta) {
+                int avatarSize = 14;
+                int avatarY = y + (ROSTER_ROW_HEIGHT - avatarSize) / 2;
+                CampfireUi.drawAvatar(context, textRenderer, m.name(), x + 4, avatarY, avatarSize, m.host(), m.host());
+
+                String name = m.name() + (m.you() ? " (you)" : "");
+                int textX = x + 4 + avatarSize + 6;
+                context.drawTextWithShadow(textRenderer, Text.literal(name), textX,
+                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2,
+                        m.you() ? CampfireUi.ACCENT_BRIGHT : CampfireUi.TEXT_COLOR);
+
+                // A mod-list mismatch takes priority over the usual
+                // host/next-up tag - hosting can rotate to ANY player here,
+                // so catching a mismatch before it lands on someone as host
+                // matters more than the routine roster state.
+                String tag;
+                int tagColor;
+                if (m.modMismatch()) {
+                    tag = "mods differ";
+                    tagColor = CampfireUi.ERROR_COLOR;
+                } else if (m.host()) {
+                    tag = "hosting";
+                    tagColor = CampfireUi.ACCENT;
+                } else if (nextUp) {
+                    tag = "next up";
+                    tagColor = CampfireUi.MUTED_TEXT;
+                } else {
+                    tag = null;
+                    tagColor = CampfireUi.MUTED_TEXT;
+                }
+                if (tag != null) {
+                    context.drawTextWithShadow(textRenderer, Text.literal(tag),
+                            x + width - 4 - textRenderer.getWidth(tag),
+                            y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, tagColor);
+                }
+            }
+        };
+    }
+
+    private CampfireScrollPane.Row awayRow(CampfireClient.AwayMember a) {
+        return new CampfireScrollPane.Row() {
+            @Override
+            public int height() {
+                return ROSTER_ROW_HEIGHT;
+            }
+
+            @Override
+            public void render(DrawContext context, int x, int y, int width, int mouseX, int mouseY, boolean hovered, float delta) {
+                int avatarSize = 14;
+                int avatarY = y + (ROSTER_ROW_HEIGHT - avatarSize) / 2;
+                CampfireUi.drawAvatar(context, textRenderer, a.name(), x + 4, avatarY, avatarSize, false, false);
+                int textX = x + 4 + avatarSize + 6;
+                context.drawTextWithShadow(textRenderer, Text.literal(a.name()), textX,
+                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);
+                String tag = describeLastSeen(a.lastSeenMs());
+                context.drawTextWithShadow(textRenderer, Text.literal(tag),
+                        x + width - 4 - textRenderer.getWidth(tag),
+                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);
+            }
+        };
     }
 
     private static String describeLastSeen(long lastSeenMs) {

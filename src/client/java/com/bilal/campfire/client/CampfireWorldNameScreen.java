@@ -20,7 +20,6 @@ class CampfireWorldNameScreen extends Screen {
     private final CampfireClient mod;
     private final Screen parent;
     private TextFieldWidget nameField;
-    private final long openedAtMs = System.currentTimeMillis();
 
     CampfireWorldNameScreen(CampfireClient mod, Screen parent) {
         super(Text.literal("Name the Shared World"));
@@ -38,6 +37,7 @@ class CampfireWorldNameScreen extends Screen {
                 Text.literal("World name"));
         nameField.setMaxLength(MAX_NAME_LENGTH);
         nameField.setText("Our Campfire");
+        CampfireUi.styleTextField(nameField);
         this.addDrawableChild(nameField);
         this.setInitialFocus(nameField);
 
@@ -63,6 +63,7 @@ class CampfireWorldNameScreen extends Screen {
         int panelBottom = panelTop + 148;
         CampfireUi.drawPanel(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
         CampfireUi.drawEmbers(context, centerX - PANEL_HALF_WIDTH, panelTop, centerX + PANEL_HALF_WIDTH, panelBottom);
+        CampfireUi.drawFieldFrame(context, this.textRenderer, nameField, "World name:");
         super.render(context, mouseX, mouseY, delta);
 
         CampfireUi.drawTitle(context, this.textRenderer, this.title, centerX, panelTop + 10);
@@ -70,16 +71,11 @@ class CampfireWorldNameScreen extends Screen {
         CampfireUi.drawCenteredWrapped(context, this.textRenderer,
                 "Call it anything - this is the name everyone sees.",
                 centerX, panelTop + 32, 300, CampfireUi.TEXT_COLOR);
-        context.drawTextWithShadow(this.textRenderer,
-                Text.literal("World name:"),
-                centerX - 120, panelTop + 51, CampfireUi.TEXT_COLOR);
         // One measured line (~280px < 300) - anything longer would wrap into
         // the buttons at panelTop + 104.
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal("Created on this computer, shared with the group."),
                 centerX, panelTop + 88, CampfireUi.MUTED_TEXT);
-
-        CampfireUi.drawOpenFade(context, this.width, this.height, openedAtMs);
     }
 
     @Override
