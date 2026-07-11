@@ -86,6 +86,12 @@ async function main() {
   const uploader = await connect('alice');
   await waitFor(uploader, (m) => m.type === 'state'); // initial state after hello
 
+  // save_upload_begin now requires being the (most recent) host - a real
+  // client never uploads without having actually hosted first (uploadSave
+  // only ever runs from onServerStopped), so claim it the same way here.
+  uploader.send(JSON.stringify({ type: 'im_hosting' }));
+  await waitFor(uploader, (m) => m.type === 'host_confirmed' || (m.type === 'state' && m.hostId === 'alice'));
+
   // --- Upload ---
   uploader.send(JSON.stringify({ type: 'save_upload_begin' }));
   const beginAck = await waitFor(uploader, (m) => m.type === 'save_upload_begin_ack');

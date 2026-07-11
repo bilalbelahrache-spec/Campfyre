@@ -67,6 +67,20 @@ const CHUNK_SIZE = 2 * 1024 * 1024;
 // playerIds would grow the group record forever.
 const MAX_REMEMBERED_NAMES = 200;
 
+// Cap on concurrently-CONNECTED members. pruneRememberedNames only evicts
+// players who've actually left (this.members no longer has them) - nothing
+// bounded how many could be simultaneously "hello'd" at once. A real
+// campfire is a small friend group (the whole feature this coordinator
+// exists for), so this is generous headroom above any real use, not a
+// meaningful limit on legitimate play: a group id is its own access control
+// (see index.js), so anyone who has a leaked/guessed code could otherwise
+// script open connections with unique playerIds and full 400-entry mods
+// arrays until the group's single stored `meta` blob - shared with
+// everything else in this Durable Object - blows past the 2MB storage-value
+// ceiling, permanently breaking state persistence for that group's actual
+// players (every saveMeta() call starts throwing).
+const MAX_CONCURRENT_MEMBERS = 40;
+
 const DEFAULT_META = {
   groupLabel: null, // the groupId, remembered for logs (a DO can't read its own name)
   everHello: false, // distinguishes a real group from a typo'd code someone probed
@@ -94,6 +108,14 @@ const DEFAULT_META = {
   // ever matters), so a mismatch has to be visible in the roster BEFORE it
   // lands on someone as host - see groupStateMessage below.
   modHashes: {},
+  // playerId -> string[] of "id@version" entries (same list modHashes was
+  // hashed from), from each 'hello'. The hash alone can only say "differs" -
+  // this is what lets CampfireModsScreen say WHICH mods, so a crash from a
+  // missing/mismatched content mod is actually diagnosable instead of just
+  // flagged. Capped hard on ingestion (see the hello handler) - Durable
+  // Object storage values cap at 2MB, and `meta` is one stored blob shared
+  // with everything else in this object.
+  modLists: {},
   emptySince: null,
   pendingMigrationStartedAt: null,
   lastUploadActivityMs: 0,
@@ -148,6 +170,7 @@ export class CampfireGroup {
       // the STORED object as-is for any group that already has one, so a
       // field added later is simply missing rather than defaulted.
       if (!this.meta.modHashes) this.meta.modHashes = {};
+      if (!this.meta.modLists) this.meta.modLists = {};
       // Same for ownerId/worldSettings: a group persisted before this
       // shipped just has them undefined, not null - normalize so
       // `!this.meta.ownerId` checks below behave the same for old and new
@@ -226,6 +249,11 @@ export class CampfireGroup {
       // hibernation - the whole object can leave memory while the player
       // stays connected, and message/close events wake it back up.
       this.ctx.acceptWebSocket(pair[1]);
+      // Stashed so the 'hello' handler can rate-limit brand-new-group
+      // creation by IP (see checkGroupCreationAllowed) - the original
+      // upgrade request object won't survive hibernation, so this is the
+      // only chance to capture it.
+      pair[1].serializeAttachment({ ip: request.headers.get('CF-Connecting-IP') || null });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -234,7 +262,7 @@ export class CampfireGroup {
     if (path === '/status') return this.handleStatus();
     if (path === '/save' && request.method === 'GET') return this.handleDownload();
     if (path === '/save' && request.method === 'POST') return this.handleLegacyUpload(request);
-    if (path === '/save/begin' && request.method === 'POST') return this.handleUploadBegin();
+    if (path === '/save/begin' && request.method === 'POST') return this.handleUploadBegin(request);
     if (path.startsWith('/save/part/') && request.method === 'PUT') return this.handleUploadPart(request, url);
     if (path === '/save/commit' && request.method === 'POST') return this.handleUploadCommit(request);
     // The outer Worker pokes this before it starts reading a legacy upload
@@ -280,7 +308,13 @@ export class CampfireGroup {
       queue: m.queue,
       members: [...this.members.keys()].map((id) => {
         const mh = m.modHashes[id];
-        return { id, name: m.names[id] || id, modHash: mh ? mh.hash : null, modCount: mh ? mh.count : null };
+        return {
+          id,
+          name: m.names[id] || id,
+          modHash: mh ? mh.hash : null,
+          modCount: mh ? mh.count : null,
+          mods: m.modLists[id] || [],
+        };
       }),
       away: Object.keys(m.names)
         .filter((id) => !this.members.has(id))
@@ -295,25 +329,55 @@ export class CampfireGroup {
   }
 
   async webSocketMessage(ws, raw) {
-    const meta = await this.loaded();
     let msg;
     try {
       msg = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
     } catch {
       return this.send(ws, { type: 'error', reason: 'bad_json' });
     }
+    try {
+      await this.handleParsedMessage(ws, msg);
+    } catch (err) {
+      // Unlike the Node coordinator (server.js wraps its whole per-message
+      // dispatch in the exact same way, after an incident where an uncaught
+      // exception mid-handler killed the process for every other group
+      // too), this had nothing catching a throw past JSON.parse - a
+      // malformed-but-valid-JSON field reaching unsafe code (e.g. a
+      // non-string save_upload_part 'data') threw straight out of this
+      // method with no reply to the client and no guarantee the group's own
+      // Durable Object survives it cleanly. Lower blast radius than the old
+      // Node bug (one DO per group here, not one process for everyone) but
+      // still a real failure mode for one malformed message.
+      this.log(`error handling '${msg && msg.type}': ${err && err.stack ? err.stack : err}`);
+      this.send(ws, { type: 'error', reason: 'server_error' });
+    }
+  }
 
+  async handleParsedMessage(ws, msg) {
+    const meta = await this.loaded();
     const att = ws.deserializeAttachment() || {};
 
     if (msg.type === 'hello') {
       if (!isValidGroupId(msg.groupId) || !isValidPlayerId(msg.playerId)) {
         return this.send(ws, { type: 'error', reason: 'invalid_id' });
       }
+      if (!(await this.checkGroupCreationAllowed(att.ip))) {
+        this.log(`rejected hello that would create a new group - IP ${att.ip || 'unknown'} is over the group-creation rate limit`);
+        return this.send(ws, { type: 'error', reason: 'rate_limited' });
+      }
       const playerId = msg.playerId;
+      // Reconnects (an existing member saying hello again) must always be
+      // allowed through even at the cap - only a genuinely NEW member past
+      // the limit gets rejected.
+      if (!this.members.has(playerId) && this.members.size >= MAX_CONCURRENT_MEMBERS) {
+        this.log(`rejected hello from ${playerId} - group already at ${MAX_CONCURRENT_MEMBERS} concurrent members`);
+        return this.send(ws, { type: 'error', reason: 'group_full' });
+      }
       // The connection's identity must survive hibernation, so it rides on
       // the socket itself - this is the DO equivalent of the Node version's
-      // per-connection closure variables.
-      ws.serializeAttachment({ playerId });
+      // per-connection closure variables. Keeps the ip captured at upgrade
+      // time too (unused after this point, but cheap to preserve).
+      ws.serializeAttachment({ playerId, ip: att.ip });
 
       // A reconnect while the old socket is still lingering: the new socket
       // wins; close the old one quietly so its close event can't later
@@ -337,6 +401,13 @@ export class CampfireGroup {
         ? msg.modCount
         : null;
       meta.modHashes[playerId] = { hash: modHash, count: modCount };
+      // Same tolerant treatment, capped hard (80 chars/400 entries) since
+      // this lands in the same storage-capped `meta` blob as everything
+      // else - matches the Node coordinator's cap so both accept the same
+      // protocol even though only the Worker actually needs it enforced.
+      meta.modLists[playerId] = Array.isArray(msg.mods)
+        ? msg.mods.filter((mEntry) => typeof mEntry === 'string' && mEntry.length <= 80).slice(0, 400)
+        : [];
       delete meta.lastSeen[playerId]; // they're here, not "last seen"
       meta.emptySince = null;
       await this.setAlarmFor('purge', null);
@@ -371,6 +442,18 @@ export class CampfireGroup {
       if (meta.hostId && meta.hostId !== playerId && this.members.has(meta.hostId)) {
         this.log(`${playerId} tried to claim host but ${meta.hostId} is already hosting - rejected`);
         return this.send(ws, { type: 'error', reason: 'already_hosting' });
+      }
+      // handleDeparture clears hostId (and broadcasts that) BEFORE the
+      // pending-migration wait for the outgoing host's upload even starts,
+      // so hostId is null for the whole gating window - the check above
+      // alone can't stop a DIFFERENT queue-front client from claiming host
+      // during that window and starting from whatever stale save it
+      // already has locally, exactly the race pendingMigrationStartedAt
+      // exists to prevent, just reached through 'im_hosting' instead of
+      // the 'migrate' broadcast it actually gates.
+      if (meta.pendingMigrationStartedAt !== null) {
+        this.log(`${playerId} tried to claim host while a migration is still pending - rejected`);
+        return this.send(ws, { type: 'error', reason: 'migration_pending' });
       }
       meta.hostId = playerId;
       meta.lastHostId = playerId;
@@ -418,6 +501,22 @@ export class CampfireGroup {
     // this yet (the client gives up waiting for an ack and falls back).
 
     if (msg.type === 'save_upload_begin') {
+      // Only the (most recent) host may start an upload - nothing else
+      // checked this before, so any connected member could overwrite the
+      // group's only save with two messages. meta.hostId itself is NOT the
+      // right field to check here: the outgoing host's own 'leaving'
+      // message (sent from onServerStopping, before the client zips and
+      // uploads anything) already clears hostId to null by the time this
+      // runs - see handleDeparture. meta.lastHostId is what stays correctly
+      // pointed at them: it's set once on im_hosting and, thanks to the
+      // migration_pending guard blocking any OTHER im_hosting claim until
+      // this same upload lands or times out, nothing can reassign it out
+      // from under a legitimate in-flight upload.
+      if (playerId !== meta.lastHostId) {
+        this.log(`rejected save upload from ${playerId} - not the (most recent) host`);
+        this.send(ws, { type: 'save_upload_error', reason: 'not_host' });
+        return;
+      }
       // Cap concurrent uploads per group at 1 (a Durable Object only ever
       // holds one group's staging rows, so any existing one is this
       // group's) - a legitimate migration never needs two in flight, and
@@ -460,7 +559,17 @@ export class CampfireGroup {
         return;
       }
 
-      const buf = base64ToArrayBuffer(msg.data);
+      if (typeof msg.data !== 'string') {
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'bad_part' });
+        return;
+      }
+      let buf;
+      try {
+        buf = base64ToArrayBuffer(msg.data);
+      } catch {
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'bad_part' });
+        return;
+      }
       if (msg.index === 0) {
         // Never let garbage replace the only copy of a world: every zip starts "PK".
         const head = new Uint8Array(buf.slice(0, 4));
@@ -492,6 +601,16 @@ export class CampfireGroup {
       const staging = await this.ctx.storage.get(`staging:${uploadId}`);
       if (!staging) {
         this.send(ws, { type: 'save_upload_error', uploadId, reason: 'unknown_upload' });
+        return;
+      }
+      if (!staging.chunks || !staging.size) {
+        // Nothing was ever actually staged (a 'begin' immediately followed
+        // by 'commit' with no parts in between skips even the "starts with
+        // PK" check, which only runs when part index 0 is uploaded) - commit
+        // unconditionally replaced the real save with an empty one and
+        // deleted the old chunks, with no way to recover them.
+        await this.ctx.storage.delete(`staging:${uploadId}`);
+        this.send(ws, { type: 'save_upload_error', uploadId, reason: 'empty_upload' });
         return;
       }
       await this.ctx.storage.delete(`staging:${uploadId}`);
@@ -528,7 +647,22 @@ export class CampfireGroup {
     // host is trusted to set this - same as direct_address elsewhere.
     if (msg.type === 'world_settings_report') {
       if (playerId !== meta.hostId) return;
-      meta.worldSettings = msg.settings || null;
+      // Unlike every other field folded into this same storage-capped `meta`
+      // blob (modLists capped 80 chars x 400 entries, names/queue/members
+      // all bounded), this had no size check at all before storing it
+      // as-is. A gamerule/difficulty/time/weather snapshot is naturally
+      // tiny (well under 1KB in practice), so an oversized payload here can
+      // only be a bug or a deliberately hostile host - either way, once
+      // `meta` crosses the 2MB storage-value ceiling, EVERY future
+      // saveMeta() call throws, permanently bricking the group (every join/
+      // action fails) until manual intervention. Reject rather than
+      // truncate - a corrupted/partial settings snapshot is worse than none.
+      const settings = msg.settings ?? null;
+      if (settings !== null && JSON.stringify(settings).length > 8192) {
+        this.log(`rejected oversized world_settings_report from ${playerId}`);
+        return;
+      }
+      meta.worldSettings = settings;
       await this.saveMeta();
       this.broadcastState();
       return;
@@ -706,6 +840,33 @@ export class CampfireGroup {
     return (await this.ctx.storage.get('save')) || null;
   }
 
+  // POST /groups/new is the only place meant to mint a brand-new group, and
+  // it's rate-limited per IP (limiter.js) specifically because it's the one
+  // unauthenticated action that instantiates real state for free. But /ws +
+  // 'hello' and the HTTP upload routes both accept ANY syntactically-valid
+  // groupId (see isValidGroupId) with no relation to /groups/new required -
+  // each is its own free path to instantiating a brand-new Durable Object
+  // and, via the upload routes, staging up to UPLOAD_MAX_BYTES (2GB) into
+  // it with zero throttling. A script could mint unlimited fake groups this
+  // way and upload ~2GB to each, exhausting the account's shared storage/
+  // request ceilings for every real group, not just its own. Checked only
+  // the FIRST time a group would actually come into being (an established
+  // group's normal traffic never pays this cost) by reusing the exact same
+  // per-IP MintLimiter this Durable Object already has a binding for.
+  async isGroupAlreadyCreated() {
+    const meta = await this.loaded();
+    if (meta.everHello) return true;
+    return (await this.currentSave()) !== null;
+  }
+
+  async checkGroupCreationAllowed(ip) {
+    if (await this.isGroupAlreadyCreated()) return true;
+    if (!this.env.LIMITER) return true; // defensive; should always be bound
+    const limiterIp = ip || 'unknown';
+    const res = await this.env.LIMITER.get(this.env.LIMITER.idFromName(limiterIp)).fetch('https://limiter/groups/new');
+    return res.status !== 429;
+  }
+
   async handleExists() {
     const meta = await this.loaded();
     const save = await this.currentSave();
@@ -793,6 +954,9 @@ export class CampfireGroup {
   // unchanged for saves under Cloudflare's 100MB per-request cap. The outer
   // Worker has already unwrapped the multipart form into a raw body.
   async handleLegacyUpload(request) {
+    if (!(await this.checkGroupCreationAllowed(request.headers.get('CF-Connecting-IP')))) {
+      return Response.json({ error: 'rate limited' }, { status: 429 });
+    }
     const buf = new Uint8Array(await request.arrayBuffer());
     // Never let garbage replace the only copy of a world: every zip starts "PK".
     if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
@@ -807,8 +971,11 @@ export class CampfireGroup {
   // Chunked upload for saves too big for one request: begin -> N parts ->
   // commit. Parts land under the same chunk:<uploadId>:<n> keys they'll be
   // served from, so commit is just validation + the atomic pointer flip.
-  async handleUploadBegin() {
+  async handleUploadBegin(request) {
     const meta = await this.loaded();
+    if (!(await this.checkGroupCreationAllowed(request.headers.get('CF-Connecting-IP')))) {
+      return Response.json({ error: 'rate limited' }, { status: 429 });
+    }
     // Same concurrent-upload cap as the WebSocket path - see save_upload_begin.
     const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
     if (existing.size > 0) {
@@ -880,6 +1047,13 @@ export class CampfireGroup {
     if (body.parts !== undefined && body.parts !== staging.partsReceived) {
       return Response.json({ error: `have ${staging.partsReceived} parts, commit says ${body.parts}` }, { status: 400 });
     }
+    if (!staging.chunks || !staging.size) {
+      // Same "commit with nothing actually staged" gap as the WebSocket
+      // path - 'parts' is caller-supplied and skippable by omitting it from
+      // the body entirely, so the check above alone doesn't close this.
+      await this.ctx.storage.delete(`staging:${uploadId}`);
+      return Response.json({ error: 'empty upload' }, { status: 400 });
+    }
     await this.ctx.storage.delete(`staging:${uploadId}`);
     return this.finishUpload(uploadId, staging.chunks, staging.size);
   }
@@ -926,6 +1100,7 @@ export class CampfireGroup {
       delete m.names[id];
       delete m.lastSeen[id];
       delete m.modHashes[id];
+      delete m.modLists[id];
     }
   }
 }

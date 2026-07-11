@@ -24,6 +24,27 @@ function check(name, cond, detail = '') {
   }
 }
 
+// A fixed sleep-then-read-whatever-arrived race (this file's previous
+// approach for the Bob-connects check below) is inherently flaky - under
+// any system load variance it intermittently reads a 'state' broadcast that
+// hasn't landed yet, unrelated to whether the server behaved correctly.
+// Waits for a specific condition instead, same shape as bobMigratePromise
+// below already does for 'migrate'.
+function waitForState(client, predicate, timeoutMs = 5000) {
+  const already = client.received.filter((m) => m.type === 'state').find(predicate);
+  if (already) return Promise.resolve(already);
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      const found = client.received.filter((m) => m.type === 'state').find(predicate);
+      if (found) { resolve(found); return; }
+      if (Date.now() > deadline) { reject(new Error('timeout waiting for matching state message')); return; }
+      setTimeout(poll, 20);
+    };
+    poll();
+  });
+}
+
 function connect(groupId, playerId, playerName, onMessage) {
   const ws = new WebSocket(`${WS_BASE}/ws?group=${groupId}`);
   const received = [];
@@ -79,8 +100,7 @@ const FAKE_ZIP = Buffer.concat([
   const bob = await connect(groupId, 'bob', 'Bob', (msg) => {
     if (msg.type === 'migrate') bobMigrate(msg);
   });
-  await sleep(400);
-  const bobState = bob.received.filter((m) => m.type === 'state').pop();
+  const bobState = await waitForState(bob, (m) => m.members.length === 2).catch(() => null);
   check('bob sees 2 members', bobState && bobState.members.length === 2, JSON.stringify(bobState));
   check('ownerId is alice (first hello), not bob', bobState && bobState.ownerId === 'alice', JSON.stringify(bobState));
   check('ownerName is Alice', bobState && bobState.ownerName === 'Alice', JSON.stringify(bobState));

@@ -22,6 +22,21 @@ const { WebSocketServer } = require('ws');
 const fs = require('fs');
 const path = require('path');
 
+// Last-resort safety net: this process holds every group's live state in
+// memory (see the file header), so an uncaught error anywhere - not just in
+// the per-message handler below, which has its own try/catch - killing the
+// whole process would silently drop every connected player in every group
+// at once, not just whoever triggered it. Log loudly and keep running
+// instead of dying; a coordinator restart already loses all in-memory group
+// state (documented, accepted), so "degraded but alive" beats "cleanly
+// dead" here specifically.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL-CAUGHT] Uncaught exception (process staying up):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL-CAUGHT] Unhandled rejection (process staying up):', reason);
+});
+
 const PORT = process.env.PORT || 8080;
 const SAVES_DIR = path.join(__dirname, 'saves');
 const TRASH_DIR = path.join(SAVES_DIR, '_trash');
@@ -56,6 +71,13 @@ const MIGRATE_UPLOAD_HARD_CAP_MS = 180000;
 // who shows no sign of life for two consecutive sweeps gets terminated,
 // which fires their normal 'close' -> handleDeparture cleanup.
 const HEARTBEAT_INTERVAL_MS = 30000;
+
+// Generous headroom above any real friend group (the whole use case this
+// coordinator exists for) - not a meaningful limit on legitimate play, just
+// a ceiling on how far a leaked/guessed group code (a group id IS its own
+// access control) could be scripted into growing this group's in-memory
+// members/names/modHashes/modLists/queue without bound.
+const MAX_CONCURRENT_MEMBERS = 40;
 
 // A real friend group can easily go quiet for weeks (school, work, a break
 // from the game) and come back expecting their world exactly as they left
@@ -133,6 +155,18 @@ function getGroup(groupId) {
       // that ever matters), so a mismatch has to be visible in the roster
       // BEFORE it lands on someone as host - see groupStateMessage below.
       modHashes: new Map(),
+      // playerId -> string[] of "id@version" entries (same list modHashes
+      // was hashed from), from each 'hello'. The hash alone can only say
+      // "differs" - this is what lets CampfireModsScreen say WHICH mods, so
+      // a crash from a missing/mismatched content mod is actually
+      // diagnosable instead of just flagged. Opaque display data as far as
+      // the coordinator's concerned - same "never inspects payloads"
+      // treatment as everything else here, just type/length capped so a
+      // malformed client can't bloat group state. The cap matches the
+      // Worker coordinator's (see group.js), even though Node itself has no
+      // comparable per-value storage ceiling, so both implementations
+      // accept the same protocol.
+      modLists: new Map(),
       queue: [],
       hostId: null,
       hostDirectAddress: null,
@@ -174,6 +208,17 @@ function getGroup(groupId) {
       // connection mid-transfer just orphans the entry until GC, same as an
       // abandoned HTTP multipart upload today.
       activeUploads: new Map(),
+      // The legacy HTTP POST /groups/:groupId/save path (below) never
+      // participated in the activeUploads lock that save_upload_begin uses
+      // to keep two WebSocket-transport uploads from racing the same
+      // group's save file - and two concurrent HTTP POSTs to the same
+      // group weren't serialized against EACH OTHER either. Either
+      // combination could interleave writeFileSync/renameWithRetry calls
+      // targeting the exact same tmp/dest paths (derived only from
+      // groupId), corrupting the save or double-bumping saveVersion for
+      // what looks like one logical upload. This flag is the HTTP path's
+      // side of the same lock; see save_upload_begin and the POST handler.
+      httpUploadInProgress: false,
     });
   }
   return groups.get(groupId);
@@ -211,6 +256,7 @@ function groupStateMessage(group) {
         name: group.names.get(id) || id,
         modHash: mh ? mh.hash : null,
         modCount: mh ? mh.count : null,
+        mods: group.modLists.get(id) || [],
       };
     }),
     // Everyone the group has ever seen who ISN'T online right now, newest
@@ -352,9 +398,10 @@ function relayToPlayer(group, toPlayerId, msg) {
   send(targetWs, msg);
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   let groupId = null;
   let playerId = null;
+  const remoteIp = (req && req.socket && req.socket.remoteAddress) || 'unknown';
 
   // Heartbeat bookkeeping (see HEARTBEAT_INTERVAL_MS). Any sign of life
   // counts: a pong reply to our ping, the client's OWN keepalive pings
@@ -373,6 +420,16 @@ wss.on('connection', (ws) => {
       return send(ws, { type: 'error', reason: 'bad_json' });
     }
 
+    // A single malformed-but-valid-JSON message (missing/wrong-typed field
+    // reaching something like Buffer.from(msg.data, 'base64') with no
+    // string to decode) used to throw straight out of this async handler
+    // with nothing catching it - an unhandled rejection that takes the
+    // WHOLE process down on modern Node, dropping every group's connections
+    // at once over one bad message from any single client. Catch broadly
+    // here so a bug in any one message-type branch degrades to "this one
+    // client sees an error" instead of "everyone's session dies".
+    try {
+
     if (msg.type === 'hello') {
       if (!isValidGroupId(msg.groupId) || !isValidPlayerId(msg.playerId)) {
         send(ws, { type: 'error', reason: 'invalid_id' });
@@ -380,7 +437,38 @@ wss.on('connection', (ws) => {
       }
       groupId = msg.groupId;
       playerId = msg.playerId;
+      if (!isGroupAlreadyCreated(groupId) && !isGroupCreationAllowed(remoteIp)) {
+        log(`[${groupId}] rejected hello that would create a new group - ${remoteIp} is over the group-creation rate limit`);
+        send(ws, { type: 'error', reason: 'rate_limited' });
+        groupId = null;
+        playerId = null;
+        return;
+      }
       const group = getGroup(groupId);
+
+      // Reconnects (an existing member saying hello again) always win even
+      // at the cap below; only a genuinely new member past the limit is
+      // rejected. A group id is its own access control (see the file
+      // header) - without a cap, anyone who has a leaked/guessed code could
+      // script open connections with unique playerIds forever, growing
+      // this group's members/names/modHashes/modLists/queue without bound.
+      if (!group.members.has(playerId) && group.members.size >= MAX_CONCURRENT_MEMBERS) {
+        log(`[${groupId}] rejected hello from ${playerId} - group already at ${MAX_CONCURRENT_MEMBERS} concurrent members`);
+        send(ws, { type: 'error', reason: 'group_full' });
+        return;
+      }
+
+      // A reconnect while the old socket is still lingering: the new
+      // socket wins: close the old one right away (rather than leaving it
+      // for the heartbeat sweep to eventually notice) so its own belated
+      // close event can't later evict this live entry - handleDeparture's
+      // same-socket check already guards against that too, but closing it
+      // promptly here means stale-connection cleanup doesn't wait up to a
+      // full heartbeat cycle.
+      const oldSocket = group.members.get(playerId);
+      if (oldSocket && oldSocket !== ws) {
+        try { oldSocket.close(); } catch { /* already gone */ }
+      }
 
       group.members.set(playerId, ws);
       group.names.set(playerId, String(msg.playerName || playerId).slice(0, 32));
@@ -395,6 +483,13 @@ wss.on('connection', (ws) => {
         ? msg.modCount
         : null;
       group.modHashes.set(playerId, { hash: modHash, count: modCount });
+      // Same tolerant treatment: drop anything that isn't a short string
+      // rather than rejecting the hello over it, cap the array itself so a
+      // broken/hostile client can't balloon this group's memory footprint.
+      const mods = Array.isArray(msg.mods)
+        ? msg.mods.filter((m) => typeof m === 'string' && m.length <= 80).slice(0, 400)
+        : [];
+      group.modLists.set(playerId, mods);
       group.lastSeen.delete(playerId); // they're here, not "last seen"
       group.emptySince = null;
       if (!group.queue.includes(playerId)) group.queue.push(playerId);
@@ -445,6 +540,20 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'error', reason: 'already_hosting' });
         return;
       }
+      // handleDeparture clears hostId (and broadcasts that) BEFORE the
+      // pending-migration wait for the outgoing host's upload even starts -
+      // that's what lets a freshly-idle "Open the World" button appear
+      // right away instead of a confusing dead period. But it also means
+      // hostId==null for the whole gating window, so the check above alone
+      // can't stop a DIFFERENT queue-front client from claiming host during
+      // that exact window and starting from whatever stale save it already
+      // has locally - precisely the race beginPendingMigration exists to
+      // prevent, just reached through 'im_hosting' instead of 'migrate'.
+      if (group.pendingMigration) {
+        log(`[${groupId}] ${playerId} tried to claim host while a migration is still pending - rejected`);
+        send(ws, { type: 'error', reason: 'migration_pending' });
+        return;
+      }
       group.hostId = playerId;
       group.lastHostId = playerId;
       // A new host's direct address (if any) hasn't been discovered yet -
@@ -483,7 +592,7 @@ wss.on('connection', (ws) => {
     }
 
     if (msg.type === 'leaving') {
-      handleDeparture(groupId, playerId);
+      handleDeparture(groupId, playerId, ws);
       return;
     }
 
@@ -499,15 +608,39 @@ wss.on('connection', (ws) => {
     // 'save_upload_begin_ack'/'save_download_begin' and falls back itself).
 
     if (msg.type === 'save_upload_begin') {
+      // Only the (most recent) host may start an upload - nothing checked
+      // this before, so any connected member could overwrite the group's
+      // only save with two messages. group.hostId itself is NOT the right
+      // field: the outgoing host's own 'leaving' message (sent before the
+      // client zips and uploads anything) already clears hostId to null via
+      // handleDeparture by the time this runs. group.lastHostId is what
+      // stays correctly pointed at them - set once on im_hosting, and
+      // nothing can reassign it out from under a legitimate in-flight
+      // upload because the pendingMigration gate blocks any OTHER
+      // im_hosting claim until this same upload lands or times out.
+      if (playerId !== group.lastHostId) {
+        log(`[${groupId}] rejected save upload from ${playerId} - not the (most recent) host`);
+        send(ws, { type: 'save_upload_error', reason: 'not_host' });
+        return;
+      }
       // Cap concurrent uploads per group at 1 - nothing about a legitimate
       // migration ever needs two in flight at once, and without this a
       // client could open unlimited uploadIds and stage unbounded buffers.
-      if (group.activeUploads.size > 0) {
+      // Also checked against the HTTP path's own lock (httpUploadInProgress)
+      // - see its definition in getGroup() for why the two need to share one.
+      if (group.activeUploads.size > 0 || group.httpUploadInProgress) {
         send(ws, { type: 'save_upload_error', reason: 'upload_already_in_progress' });
         return;
       }
       const uploadId = crypto.randomUUID();
-      group.activeUploads.set(uploadId, { parts: [], size: 0, startedAt: Date.now() });
+      // Tags which connection owns this upload so a disconnect mid-transfer
+      // (exactly the scenario this whole system exists for - a host
+      // quitting while its save streams out) can release the lock right
+      // away in handleDeparture, instead of every OTHER save upload for
+      // this group - including the new host's own first upload - being
+      // rejected with upload_already_in_progress for up to the full
+      // WS_UPLOAD_ABANDON_MS (10 minute) sweep window.
+      group.activeUploads.set(uploadId, { parts: [], size: 0, startedAt: Date.now(), ws });
       group.uploadsInFlight += 1;
       group.lastUploadActivityMs = Date.now();
       send(ws, { type: 'save_upload_begin_ack', uploadId });
@@ -521,6 +654,10 @@ wss.on('connection', (ws) => {
         return;
       }
       group.lastUploadActivityMs = Date.now();
+      if (typeof msg.data !== 'string' || !Number.isInteger(msg.index) || msg.index < 0) {
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'bad_part' });
+        return;
+      }
       // Overwriting the same index again (a retried part) is harmless - the
       // same bytes just land in the same slot.
       const buf = Buffer.from(msg.data, 'base64');
@@ -544,17 +681,32 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'unknown_upload' });
         return;
       }
-      group.activeUploads.delete(msg.uploadId);
-      group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
       group.lastUploadActivityMs = Date.now();
+      // The activeUploads entry (and the "another upload can't start" lock
+      // save_upload_begin checks via activeUploads.size) used to be released
+      // right here, before the disk write below even started - so a client
+      // that assumed a slow write meant failure and retried with a whole
+      // new save_upload_begin could open a second writer racing the same
+      // tmp/dest paths (both derived only from groupId) while THIS commit's
+      // write+rename was still in flight, corrupting the save or
+      // double-bumping saveVersion for what the client thinks is one
+      // logical upload. The lock now stays held for the actual duration it
+      // exists to serialize - released only once below, after the write
+      // (success OR failure) has genuinely finished.
+      const releaseUploadLock = () => {
+        group.activeUploads.delete(msg.uploadId);
+        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+      };
 
       if (up.parts.some((p) => !p)) {
+        releaseUploadLock();
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'missing_part' });
         return;
       }
       const buf = Buffer.concat(up.parts);
       // Same cheap sanity check as the HTTP upload: every zip starts with "PK".
       if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+        releaseUploadLock();
         log(`[${groupId}] rejected websocket save upload - not a zip (${buf.length} bytes)`);
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'not_a_zip' });
         return;
@@ -569,9 +721,11 @@ wss.on('connection', (ws) => {
       } catch (e) {
         log(`[${groupId}] websocket save upload failed - couldn't move the new zip into place: ${e.message}`);
         try { fs.unlinkSync(tmp); } catch { /* sweep gets it later */ }
+        releaseUploadLock();
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'write_failed' });
         return;
       }
+      releaseUploadLock();
 
       group.saveVersion += 1;
       broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
@@ -677,10 +831,14 @@ wss.on('connection', (ws) => {
       }
       return;
     }
+    } catch (err) {
+      log(`[${groupId || '?'}] error handling '${msg && msg.type}' message from ${playerId || '?'}: ${err && err.message}`);
+      try { send(ws, { type: 'error', reason: 'server_error' }); } catch { /* socket already gone */ }
+    }
   });
 
   ws.on('close', () => {
-    if (groupId && playerId) handleDeparture(groupId, playerId);
+    if (groupId && playerId) handleDeparture(groupId, playerId, ws);
   });
 });
 
@@ -699,7 +857,7 @@ setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL_MS);
 
-function handleDeparture(groupId, playerId) {
+function handleDeparture(groupId, playerId, ws) {
   const group = getGroup(groupId);
 
   if (!group.members.has(playerId) && !group.queue.includes(playerId)) {
@@ -707,11 +865,40 @@ function handleDeparture(groupId, playerId) {
              // close event both call this for a normal clean quit
   }
 
+  // If this player already has a DIFFERENT, newer socket registered (a
+  // reconnect that raced ahead of this stale connection's own belated
+  // 'close'/'leaving'), this departure is stale and must not evict the live
+  // session or migrate away from a host who's actually still connected -
+  // only the socket that's actually still the current registered one is
+  // allowed to remove itself.
+  if (ws && group.members.get(playerId) !== ws) {
+    return;
+  }
+
   const wasHost = group.hostId === playerId;
 
   group.members.delete(playerId);
   group.queue = group.queue.filter((id) => id !== playerId);
   group.lastSeen.set(playerId, Date.now());
+  // Unlike names/lastSeen (deliberately kept so the "away" roster stays
+  // labeled), mod-mismatch data only means anything for someone currently
+  // in the live roster being compared against - keeping it around after
+  // departure was pure unbounded growth (one entry per distinct playerId
+  // ever seen, forever) with no feature depending on it surviving.
+  group.modHashes.delete(playerId);
+  group.modLists.delete(playerId);
+  // Release any upload this exact connection had in flight right away,
+  // rather than leaving every other save upload for this group blocked on
+  // upload_already_in_progress until the 10-minute abandoned-upload sweep
+  // catches up.
+  if (ws) {
+    for (const [uploadId, up] of group.activeUploads) {
+      if (up.ws === ws) {
+        group.activeUploads.delete(uploadId);
+        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+      }
+    }
+  }
   log(`[${groupId}] ${playerId} left${wasHost ? ' (was host)' : ''}`);
 
   if (group.members.size === 0) {
@@ -811,6 +998,14 @@ function renameWithRetry(src, dest, attempts = 15, delayMs = 400) {
 function markUploadInFlight(req, res, next) {
   const { groupId } = req.params;
   if (isValidGroupId(groupId)) {
+    if (!isGroupAlreadyCreated(groupId)) {
+      const ip = req.socket.remoteAddress || 'unknown';
+      if (!isGroupCreationAllowed(ip)) {
+        log(`[${groupId}] rejected upload that would create a new group - ${ip} is over the group-creation rate limit`);
+        res.status(429).json({ error: 'too many new groups from this address - try again later' });
+        return;
+      }
+    }
     const group = getGroup(groupId);
     group.uploadsInFlight += 1;
     group.lastUploadActivityMs = Date.now();
@@ -831,6 +1026,17 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
   const { groupId } = req.params;
   if (!isValidGroupId(groupId)) return res.status(400).json({ error: 'invalid group id' });
   if (!req.file) return res.status(400).json({ error: 'missing file' });
+  const group = getGroup(groupId);
+  // Same lock save_upload_begin uses (activeUploads.size), from the other
+  // side - see httpUploadInProgress's definition in getGroup() for why a
+  // second concurrent writer here (whether another HTTP POST or a
+  // WebSocket-transport upload) can't be allowed to interleave with this
+  // one's writeFileSync/rename against the same tmp/dest paths.
+  if (group.activeUploads.size > 0 || group.httpUploadInProgress) {
+    return res.status(409).json({ error: 'upload already in progress' });
+  }
+  group.httpUploadInProgress = true;
+  try {
   // The stored zip is the ONLY copy of the group's world - never let
   // garbage replace it. Cheap sanity check (every zip starts with "PK"),
   // then write-to-temp + rename so a crash/disk-full mid-write can never
@@ -855,7 +1061,6 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
     // never 4xx.
     return res.status(503).json({ error: 'save file busy - retry' });
   }
-  const group = getGroup(groupId);
   group.saveVersion += 1;
   broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
   log(`[${groupId}] save uploaded (${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
@@ -867,6 +1072,9 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
   }
 
   res.json({ ok: true, saveVersion: group.saveVersion });
+  } finally {
+    group.httpUploadInProgress = false;
+  }
 });
 
 app.get('/groups/:groupId/save', (req, res) => {
@@ -934,16 +1142,41 @@ const MINT_LIMIT_PER_HOUR = 20;
 const MINT_WINDOW_MS = 60 * 60 * 1000;
 const mintHistory = new Map(); // ip -> [timestamps within the window]
 
-app.post('/groups/new', (req, res) => {
-  const ip = req.socket.remoteAddress || 'unknown';
+// Shared by /groups/new AND anywhere else a request could instantiate a
+// brand-new group (the 'hello' handler, the upload route's
+// markUploadInFlight) - see isGroupAlreadyCreated below for why those other
+// paths need this too. Records the attempt as it checks, same as the
+// original /groups/new-only version did.
+function isGroupCreationAllowed(ip) {
   const now = Date.now();
   const recent = (mintHistory.get(ip) || []).filter((t) => now - t < MINT_WINDOW_MS);
-  if (recent.length >= MINT_LIMIT_PER_HOUR) {
+  if (recent.length >= MINT_LIMIT_PER_HOUR) return false;
+  recent.push(now);
+  mintHistory.set(ip, recent);
+  return true;
+}
+
+// /groups/new is rate-limited per IP, but 'hello' and the upload route both
+// accept ANY syntactically-valid groupId (see isValidGroupId) with no
+// relation to /groups/new required - getGroup() lazily instantiates real
+// (if empty) state for one, and the upload route accepts up to 2GB into it,
+// with zero throttling either way. A script could mint unlimited fake
+// groups through either path and upload ~2GB to each, exhausting the
+// coordinator's disk for every real group, not just its own. Checked only
+// for a group that doesn't already have real state - an established
+// group's normal traffic never pays this cost.
+function isGroupAlreadyCreated(groupId) {
+  return groups.has(groupId)
+    || fs.existsSync(path.join(SAVES_DIR, `${groupId}.zip`))
+    || fs.existsSync(path.join(TRASH_DIR, `${groupId}.zip`));
+}
+
+app.post('/groups/new', (req, res) => {
+  const ip = req.socket.remoteAddress || 'unknown';
+  if (!isGroupCreationAllowed(ip)) {
     log(`[mint] rate-limited ${ip}`);
     return res.status(429).send('too many new groups from this address - try again later');
   }
-  recent.push(now);
-  mintHistory.set(ip, recent);
   res.json({ groupId: generateGroupCode() });
 });
 
