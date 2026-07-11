@@ -38,10 +38,19 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
-node_modules/ 
-.gradle/ 
-build/ 
-.idea/ 
-*.iml 
-run/ 
-run2/ 
+node_modules/
+.gradle/
+build/
+.idea/
+*.iml
+run/
+run2/
+
+# coordinator dev logs (Start-Process redirects stdout/stderr here per CLAUDE.md)
+coordinator/coordinator/*.log
+
+# local Claude Code tooling and dev notes, not project content
+.agents/
+CLAUDE.md
+src/CLAUDE.md
+coordinator/coordinator/CLAUDE.md
