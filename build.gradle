@@ -1,3 +1,14 @@
+buildscript {
+	repositories {
+		mavenCentral()
+	}
+	dependencies {
+		// Only used by the opt-in `obfuscatedJar` task below - never touches
+		// the default build/runClient/runServer path.
+		classpath 'com.guardsquare:proguard-gradle:7.4.2'
+	}
+}
+
 plugins {
 	id 'net.fabricmc.fabric-loom-remap' version "${loom_version}"
 	id 'maven-publish'
@@ -85,6 +96,44 @@ processResources {
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 17
+	// Opt-in only (`./gradlew build -PstripDebug`) - default dev builds
+	// (runClient/runClient2/runServer) must stay fully debuggable. Compiling
+	// with no LocalVariableTable/LineNumberTable/SourceFile already
+	// meaningfully degrades a decompiler's output (locals become
+	// var1/var2/arg0, no source-line mapping) for a real distributed jar,
+	// at zero runtime risk - unlike the ProGuard task below, this can't
+	// break anything since it only omits debug metadata Java itself never
+	// needs to run.
+	if (project.hasProperty('stripDebug')) {
+		it.options.debugOptions.debugLevel = 'none'
+	}
+}
+
+// Optional, explicit release-hardening task - never part of the default
+// `build`/`runClient` graph. Renames the mod's own classes/fields/methods
+// (everything Fabric Loader and Mixin don't need to find by exact name -
+// see proguard-rules.pro) to raise the bar against casual decompiling.
+// Deliberately NOT verified by an actual game launch (this dev environment
+// can't drive one) - run `./gradlew obfuscatedJar`, then smoke-test the
+// output jar with two real players before ever distributing it.
+tasks.register('obfuscatedJar', proguard.gradle.ProGuardTask) {
+	dependsOn remapJar
+	injars remapJar.archiveFile
+	outjars layout.buildDirectory.file("libs/${project.name}-${project.version}-obfuscated.jar")
+
+	// Java 17 has no rt.jar to point at - the JDK's own modules stand in
+	// for it, plus the mod's full compile classpath (remapped Minecraft,
+	// Fabric API/Loader, weupnp) so ProGuard can resolve every reference
+	// it's tracing without those becoming "not found" warnings.
+	libraryjars "${System.getProperty('java.home')}/jmods/java.base.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+	// The client source set's compile classpath already includes everything
+	// main's does (Loom's splitEnvironmentSourceSets wiring) - passing both
+	// separately double-lists any dependency common to both (e.g.
+	// org.jetbrains:annotations), which ProGuard rejects outright as a
+	// duplicate libraryjars entry rather than silently deduplicating.
+	libraryjars sourceSets.client.compileClasspath
+
+	configuration file('proguard-rules.pro')
 }
 
 java {
