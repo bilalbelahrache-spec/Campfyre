@@ -4,6 +4,8 @@
 	"compatibilityLevel": "JAVA_17",
 	"client": [
 		"GameRendererMixin",
+		"KeyboardMixin",
+		"LivingEntityRendererMixin",
 		"MouseMixin",
 		"TitleScreenMixin"
 	],

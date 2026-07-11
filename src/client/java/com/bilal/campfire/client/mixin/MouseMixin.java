@@ -20,11 +20,17 @@ import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 //   Screen.mouseScrolled first. That's the exact same condition
 //   CampfireZoom.isHeld() already requires, so cancelling at HEAD here can
 //   never eat a GUI's scroll input.
-// - Mouse-look sensitivity is scaled down while zoomed so panning stays
-//   controlled instead of twitchy - the same idea vanilla itself already
-//   uses for the spyglass (updateMouse's own isUsingSpyglass sensitivity
-//   branch, found the same way), just proportional to however zoomed in
-//   Campfire's zoom currently is instead of a fixed spyglass amount.
+// - Mouse-look while zoomed is scaled down (CampfireZoom.scaleLookDelta) -
+//   the same idea vanilla itself already uses for the spyglass
+//   (updateMouse's own isUsingSpyglass sensitivity branch, found the same
+//   way), just proportional to however zoomed in Campfire's zoom currently
+//   is instead of a fixed spyglass amount. This mixin fires at the
+//   changeLookDirection invoke, which is AFTER vanilla's own Cinematic
+//   Camera smoothing (CampfireZoom forces GameOptions.smoothCameraEnabled
+//   on for the hold) already ran earlier in the same updateMouse call - so
+//   the damped/trailing camera feel comes from vanilla's real
+//   implementation, and this hook only needs to handle the sensitivity
+//   scale, not a second easing pass on top of it.
 @Mixin(Mouse.class)
 abstract class MouseMixin {
 
@@ -40,8 +46,7 @@ abstract class MouseMixin {
             target = "Lnet/minecraft/client/network/ClientPlayerEntity;changeLookDirection(DD)V"))
     private void campfire$scaleLookForZoom(Args args) {
         if (!CampfireZoom.isHeld()) return;
-        double factor = CampfireZoom.lookSensitivityFactor();
-        args.set(0, (double) args.get(0) * factor);
-        args.set(1, (double) args.get(1) * factor);
+        args.set(0, CampfireZoom.scaleLookDelta((double) args.get(0)));
+        args.set(1, CampfireZoom.scaleLookDelta((double) args.get(1)));
     }
 }

@@ -65,6 +65,14 @@ invite to everyone else automatically - nobody else has to configure anything. S
 Anyone who knows your invite can join your world and download its save - treat invites like a
 house key and only share them with your actual friends.
 
+## Odds and ends
+
+If every mob around you suddenly stops and stares straight at you for about 10 seconds, that's not
+a bug - it's a deliberate, extremely rare (roughly 1-in-a-million-per-second-of-play) easter egg.
+It only affects rendering on your own screen and clears itself; nothing to do but enjoy it.
+
 ## License
 
 CC0-1.0 - do whatever you like with it.
+
+yes, that was intentional.
