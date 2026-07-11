@@ -33,6 +33,14 @@ public class RelayHostMultiplexer {
         }
     }
 
+    // Generous headroom above any real campfire (the coordinator's own member
+    // cap - see MAX_CONCURRENT_MEMBERS in server.js/group.js - tops out at 40,
+    // and a legitimate player opens at most a handful of streams), not a
+    // meaningful limit on real play. Without it, nothing stopped a
+    // misbehaving/compromised coordinator (or a bug replaying relay_open)
+    // from driving unbounded thread + socket creation on the host.
+    private static final int MAX_CONCURRENT_STREAMS = 128;
+
     private final int lanPort;
     private final Consumer<JsonObject> sender;
     private final ConcurrentHashMap<String, StreamEntry> streams = new ConcurrentHashMap<>();
@@ -42,24 +50,64 @@ public class RelayHostMultiplexer {
         this.sender = sender;
     }
 
-    /** A friend wants to open a stream toward us. */
+    /**
+     * A friend wants to open a stream toward us. Called directly from
+     * CampfireClient's handleMessage on the "relay_open" case, which runs
+     * on the JDK WebSocket listener's onText - so this method itself must
+     * never block. socket.connect(...) below can take up to its own 5s
+     * timeout (routine, not just theoretical: it fires every time a friend
+     * relay-connects before the host's own LAN server has finished opening
+     * - see the comment in the catch branch), and a burst of several
+     * friends relay-joining at once would otherwise wedge coordinator
+     * message delivery - including heartbeat replies - for N x 5s, exactly
+     * the failure mode "never block the coordinator websocket thread" (see
+     * src/CLAUDE.md) warns causes the coordinator to reap the client as
+     * dead mid-operation. The actual connect - and everything after it -
+     * now runs on its own spawned thread instead.
+     */
     public void openStream(String streamId, String fromPlayerId) {
+        Thread openThread = new Thread(() -> openStreamBlocking(streamId, fromPlayerId), "relay-host-open-" + streamId);
+        openThread.setDaemon(true);
+        openThread.start();
+    }
+
+    private void openStreamBlocking(String streamId, String fromPlayerId) {
+        if (streams.size() >= MAX_CONCURRENT_STREAMS) {
+            System.out.println("[Campfire] Refusing relay stream " + streamId + " - already at the " + MAX_CONCURRENT_STREAMS + "-stream cap.");
+            sendClose(streamId, fromPlayerId);
+            return;
+        }
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress("127.0.0.1", lanPort), 5000);
         } catch (IOException e) {
             System.out.println("[Campfire] Could not connect relay stream " + streamId
                     + " to local server on port " + lanPort + " (is it open to LAN yet?): " + e.getMessage());
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
             sendClose(streamId, fromPlayerId);
             return;
         }
 
-        streams.put(streamId, new StreamEntry(fromPlayerId, socket));
+        // putIfAbsent, not put: a second relay_open for a streamId that's still
+        // in use (duplicate/replayed message) used to silently overwrite the
+        // existing StreamEntry - leaking the original socket (nothing ever
+        // closes it) and orphaning its pump thread, permanently blocked in its
+        // own read() until the real LAN server side happens to error out.
+        StreamEntry existing = streams.putIfAbsent(streamId, new StreamEntry(fromPlayerId, socket));
+        if (existing != null) {
+            System.out.println("[Campfire] Relay stream " + streamId + " already open - closing duplicate connection.");
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
+            return;
+        }
         System.out.println("[Campfire] Opened relay stream " + streamId + " for " + fromPlayerId);
 
-        Thread readerThread = new Thread(() -> pumpServerToRelay(streamId, fromPlayerId, socket), "relay-host-" + streamId);
-        readerThread.setDaemon(true);
-        readerThread.start();
+        pumpServerToRelay(streamId, fromPlayerId, socket);
     }
 
     private void pumpServerToRelay(String streamId, String toPlayerId, Socket socket) {
@@ -78,8 +126,19 @@ public class RelayHostMultiplexer {
         } catch (IOException e) {
             // real server closed the connection or errored - fall through to close
         } finally {
-            closeLocal(streamId);
-            sendClose(streamId, toPlayerId);
+            // Only the thread that actually wins the removal race sends the
+            // close - shutdownAll() closing this same socket concurrently
+            // (routine on host quit: it closes every stream's socket right
+            // as the real server going down makes every one of these reads
+            // fail at once) used to race a second, independent close attempt
+            // here. closeLocal() now reports whether IT did the removal, so
+            // exactly one relay_close goes out per stream instead of a
+            // duplicate (or, when the loser's lookup found nothing left to
+            // report a fromPlayerId for, a malformed one with no toPlayerId
+            // that the coordinator silently drops).
+            if (closeLocal(streamId)) {
+                sendClose(streamId, toPlayerId);
+            }
         }
     }
 
@@ -93,9 +152,9 @@ public class RelayHostMultiplexer {
             out.flush();
         } catch (IOException e) {
             System.out.println("[Campfire] Failed writing relay data to host stream " + streamId + ": " + e.getMessage());
-            String owner = entry.fromPlayerId;
-            closeLocal(streamId);
-            sendClose(streamId, owner);
+            if (closeLocal(streamId)) {
+                sendClose(streamId, entry.fromPlayerId);
+            }
         }
     }
 
@@ -114,14 +173,19 @@ public class RelayHostMultiplexer {
         sender.accept(close);
     }
 
-    private void closeLocal(String streamId) {
+    // Returns true only for whichever caller actually removed the entry -
+    // callers use that to decide whether THEY'RE the one responsible for
+    // announcing the close, so two threads racing to tear down the same
+    // stream (shutdownAll() vs. this stream's own pump thread noticing its
+    // socket just got closed) never both send, and never both skip.
+    private boolean closeLocal(String streamId) {
         StreamEntry entry = streams.remove(streamId);
-        if (entry != null) {
-            try {
-                entry.socket.close();
-            } catch (IOException ignored) {
-            }
+        if (entry == null) return false;
+        try {
+            entry.socket.close();
+        } catch (IOException ignored) {
         }
+        return true;
     }
 
     /** We stopped being host (or the server stopped) - tear every stream down. */
@@ -129,8 +193,9 @@ public class RelayHostMultiplexer {
         for (String streamId : streams.keySet()) {
             StreamEntry entry = streams.get(streamId);
             String owner = entry != null ? entry.fromPlayerId : null;
-            closeLocal(streamId);
-            sendClose(streamId, owner);
+            if (closeLocal(streamId)) {
+                sendClose(streamId, owner);
+            }
         }
     }
 }

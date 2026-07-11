@@ -25,6 +25,14 @@ final class UpnpPortMapper {
     record Result(String externalIp, int externalPort) {
     }
 
+    // Tracks whatever mapping tryMapPort() last successfully created, so
+    // unmapPort() can remove it later. Only ever one mapping active at a
+    // time (this mod only ever maps the single fixed HOST_LAN_PORT), so a
+    // static field is enough - no per-call handle needs to be threaded
+    // through CampfireClient's hosting-mode bookkeeping.
+    private static volatile GatewayDevice mappedGateway;
+    private static volatile int mappedPort = -1;
+
     // Returns null if there's no UPnP-capable router, the router refused the
     // mapping (corporate network, UPnP disabled), or anything else went
     // wrong - all of which are completely normal outcomes, not errors worth
@@ -60,10 +68,34 @@ final class UpnpPortMapper {
             }
 
             System.out.println("[Campfire] UPnP: mapped " + externalIp + ":" + port + " -> local port " + port);
+            mappedGateway = gateway;
+            mappedPort = port;
             return new Result(externalIp, port);
         } catch (Exception e) {
             System.out.println("[Campfire] UPnP mapping failed (this is normal on many networks): " + e.getMessage());
             return null;
+        }
+    }
+
+    // Removes whatever mapping tryMapPort() last created, if any - called
+    // when this client stops being host (quit, migrated away, left the
+    // group). Without this, every hosting session left the router forwarding
+    // the internet straight to the host's LAN Minecraft port permanently:
+    // normal quit, crash, or leaving the group all left it standing forever,
+    // clearable only by a router reboot or manually digging through the
+    // router's admin page. Blocking network I/O like tryMapPort - callers
+    // must run this off the render/server thread.
+    static void unmapPort() {
+        GatewayDevice gateway = mappedGateway;
+        int port = mappedPort;
+        if (gateway == null || port < 0) return;
+        mappedGateway = null;
+        mappedPort = -1;
+        try {
+            boolean removed = gateway.deletePortMapping(port, "TCP");
+            System.out.println("[Campfire] UPnP: removed mapping for port " + port + " -> " + removed);
+        } catch (Exception e) {
+            System.out.println("[Campfire] UPnP: failed to remove port mapping (router may still show it): " + e.getMessage());
         }
     }
 }

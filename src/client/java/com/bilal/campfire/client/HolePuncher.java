@@ -89,6 +89,14 @@ final class HolePuncher {
             probe.setReuseAddress(true);
             probe.bind(new InetSocketAddress(localPort));
             probe.connect(new InetSocketAddress(coordinatorHostname, coordinatorPort), 5000);
+            // connect() only bounds the handshake - nothing previously bounded the
+            // response read below. A coordinator that accepts but never finishes
+            // replying (hung proxy, half-open connection) left this blocked in
+            // read() forever, holding localPort hostage - every future hole-punch
+            // attempt on this client (host and friend side share the same fixed
+            // PUNCH_LOCAL_PORT) would then fail to bind and silently skip straight
+            // past this whole connectivity tier.
+            probe.setSoTimeout(5000);
 
             String request = "GET /reflect HTTP/1.1\r\nHost: " + coordinatorHostname + "\r\nConnection: close\r\n\r\n";
             probe.getOutputStream().write(request.getBytes(StandardCharsets.UTF_8));

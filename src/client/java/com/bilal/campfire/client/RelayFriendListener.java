@@ -33,6 +33,15 @@ public class RelayFriendListener {
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
+    // Distinct from `running`, which only ever flips true once a bind
+    // succeeds. Without this, a stop() landing while runAcceptLoop() is
+    // mid-retry (plausible on a rapid host/friend flip - see the loop's own
+    // comment below) went unnoticed: the loop kept retrying, could still
+    // bind successfully afterward, and set running = true again - an
+    // orphaned listener nothing holds a reference to anymore, competing for
+    // the port against whatever replacement listener stop()'s caller starts
+    // next.
+    private volatile boolean stopRequested = false;
 
     public RelayFriendListener(int port, Consumer<JsonObject> sender) {
         this.port = port;
@@ -61,10 +70,23 @@ public class RelayFriendListener {
         IOException lastFailure = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (stopRequested) {
+                System.out.println("[Campfire] Relay listener bind on port " + port + " abandoned - stop() was called mid-retry.");
+                return;
+            }
             try {
                 ServerSocket socket = new ServerSocket();
                 socket.setReuseAddress(true);
                 socket.bind(new java.net.InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 50);
+                if (stopRequested) {
+                    // Lost the race the other way: stop() fired between the check
+                    // above and this bind succeeding. Don't resurrect a listener.
+                    try {
+                        socket.close();
+                    } catch (IOException ignored) {
+                    }
+                    return;
+                }
                 serverSocket = socket;
                 running = true;
                 System.out.println("[Campfire] Relay listener ready on 127.0.0.1:" + port + " - point Direct Connect here.");
@@ -134,11 +156,19 @@ public class RelayFriendListener {
         } catch (IOException e) {
             // local Minecraft client disconnected or errored - fall through to close
         } finally {
-            closeLocal(streamId);
-            JsonObject close = new JsonObject();
-            close.addProperty("type", "relay_close");
-            close.addProperty("streamId", streamId);
-            sender.accept(close);
+            // Only send relay_close if THIS call actually performed the removal -
+            // closeStream()/abortStream()/closeAllStreams() racing in concurrently
+            // (e.g. feedData's write failing right as the local socket also stops
+            // producing reads) used to make both sides call closeLocal() and this
+            // finally block send relay_close unconditionally regardless, producing
+            // a duplicate send for the same stream. Same bug class already fixed
+            // in the sibling RelayHostMultiplexer.
+            if (closeLocal(streamId)) {
+                JsonObject close = new JsonObject();
+                close.addProperty("type", "relay_close");
+                close.addProperty("streamId", streamId);
+                sender.accept(close);
+            }
         }
     }
 
@@ -173,17 +203,19 @@ public class RelayFriendListener {
         }
     }
 
-    private void closeLocal(String streamId) {
+    /** Returns whether THIS call performed the actual removal (see pumpSocketToRelay's finally). */
+    private boolean closeLocal(String streamId) {
         Socket socket = streams.remove(streamId);
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
+        if (socket == null) return false;
+        try {
+            socket.close();
+        } catch (IOException ignored) {
         }
+        return true;
     }
 
     public void stop() {
+        stopRequested = true;
         running = false;
         closeAllStreams();
         if (serverSocket != null) {
