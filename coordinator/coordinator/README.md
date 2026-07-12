@@ -1,6 +1,6 @@
-# Campfire coordinator
+# Campfyre coordinator
 
-The "phone book" half of Campfire. It does NOT run Minecraft or touch world
+The "phone book" half of Campfyre. It does NOT run Minecraft or touch world
 simulation at all. It only:
 
 1. Knows who's currently online in each friend group.

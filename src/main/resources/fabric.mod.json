@@ -1,8 +1,8 @@
 {
 	"schemaVersion": 1,
-	"id": "campfire",
+	"id": "campfyre",
 	"version": "${version}",
-	"name": "Campfire",
+	"name": "Campfyre",
 	"description": "Share one Minecraft world with your friend group without anyone permanently hosting or forwarding ports - when the current host quits, hosting auto-hands-off to whoever's next, and friends reconnect automatically (direct via UPnP or hole-punching when possible, relayed otherwise).",
 	"authors": [
 		"Bilal"
@@ -13,20 +13,20 @@
 		"issues": "https://github.com/bilalbelahrache-spec/host-migration/issues"
 	},
 	"license": "CC0-1.0",
-	"icon": "assets/campfire/icon.png",
+	"icon": "assets/campfyre/icon.png",
 	"environment": "*",
 	"entrypoints": {
 		"main": [
-			"com.bilal.campfire.Campfire"
+			"com.bilal.campfyre.Campfyre"
 		],
 		"client": [
-			"com.bilal.campfire.client.CampfireClient"
+			"com.bilal.campfyre.client.CampfyreClient"
 		]
 	},
 	"mixins": [
-		"campfire.mixins.json",
+		"campfyre.mixins.json",
 		{
-			"config": "campfire.client.mixins.json",
+			"config": "campfyre.client.mixins.json",
 			"environment": "client"
 		}
 	],

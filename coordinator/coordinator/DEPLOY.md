@@ -1,8 +1,8 @@
-# Deploying the Campfire coordinator
+# Deploying the Campfyre coordinator
 
-Every Campfire group needs one coordinator that all players can reach.
+Every Campfyre group needs one coordinator that all players can reach.
 
-**A fresh install doesn't need any of this to just work.** `CampfireClient.DEFAULT_COORDINATOR_HOST`
+**A fresh install doesn't need any of this to just work.** `CampfyreClient.DEFAULT_COORDINATOR_HOST`
 ships pointing at the shared community coordinator, which runs on Cloudflare Workers + Durable
 Objects (see `coordinator/worker/README.md`) - free with no credit card, no sleep/wake delay, and it
 scales per-group automatically since every group gets its own isolated Durable Object. A player who's
@@ -15,8 +15,8 @@ so nearly any machine works - a $3–5/month VPS, a Raspberry Pi, or (with cavea
 home PC. It needs Node 18+, `npm install`, and one open TCP port (default `8080`).
 
 Whoever runs their own gives everyone in that group its address (e.g. `203.0.113.7:8080` or
-`campfire.example.com:8080`). The person who creates the group types that address once in the
-"Light a New Campfire" screen - after that, the invite code they share
+`campfyre.example.com:8080`). The person who creates the group types that address once in the
+"Light a New Campfyre" screen - after that, the invite code they share
 (`ABCD123XYZ@203.0.113.7:8080`) carries the address to everyone automatically.
 
 **The whole point of this design is that a coordinator's address never changes.** Nobody's game
@@ -48,7 +48,7 @@ PORT=8080 node server.js
   integration, on by default on most distros, survives a reboot too), or copy the ready-made
   `deploy/coordinator.service` systemd unit (`sudo cp deploy/coordinator.service
   /etc/systemd/system/ && sudo systemctl enable --now coordinator` - adjust `WorkingDirectory` and
-  create the `campfire` user first).
+  create the `campfyre` user first).
 
 **What about the saves?** They live in `saves/` next to `server.js` (or in the mounted `./saves`
 volume with Docker). That directory is the only copy of your group's world when nobody's playing -

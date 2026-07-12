@@ -1,4 +1,4 @@
-name = "campfire-coordinator"
+name = "campfyre-coordinator"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
@@ -9,7 +9,7 @@ compatibility_date = "2025-06-01"
 # groups never share anything.
 [[durable_objects.bindings]]
 name = "GROUPS"
-class_name = "CampfireGroup"
+class_name = "CampfyreGroup"
 
 # Tiny per-IP rate limiter for the one unauthenticated endpoint a script
 # could hammer (POST /groups/new).
@@ -25,6 +25,15 @@ class_name = "IpRateLimiter"
 
 # SQLite-backed storage is what's available on the free plan (and what the
 # save-chunk storage assumes).
+#
+# The class names in v1/v2 below are NOT typos - they're history. Cloudflare
+# tracks migrations as an append-only log of steps already applied to the
+# live Durable Object namespace; editing an already-applied tag's class name
+# doesn't rename anything remotely, it just desyncs wrangler's local state
+# from what Cloudflare actually has on record. The mod's rename from
+# Campfire -> Campfyre is expressed as a NEW step (v3, rename_classes)
+# instead, which is the only way Cloudflare actually renames a DO class
+# without orphaning its existing SQLite storage.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CampfireGroup", "MintLimiter"]
@@ -32,3 +41,9 @@ new_sqlite_classes = ["CampfireGroup", "MintLimiter"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["IpRateLimiter"]
+
+[[migrations]]
+tag = "v3"
+renamed_classes = [
+  { from = "CampfireGroup", to = "CampfyreGroup" },
+]

@@ -1,8 +1,8 @@
-# Campfire
+# Campfyre
 
 **Share one Minecraft world with your whole friend group - no server rental, no port forwarding, no one stuck being "the host."**
 
-Campfire is a Fabric client mod for Minecraft 1.20.1. Your group's world lives with whoever is
+Campfyre is a Fabric client mod for Minecraft 1.20.1. Your group's world lives with whoever is
 playing: when the current host quits, the save automatically hands off to whoever's next, and
 everyone else reconnects to them without touching a thing.
 
@@ -12,7 +12,7 @@ everyone else reconnects to them without touching a thing.
   whose turn it is to host and ferries the world save between players.
 - When the host quits mid-session, their save uploads automatically, the next player in line
   downloads it and becomes the new host, and friends reconnect to them - all hands-free.
-- Any other time, hosting is one click: **Open the World** on the Campfire screen always fetches
+- Any other time, hosting is one click: **Open the World** on the Campfyre screen always fetches
   your group's newest save first (and skips the download entirely when your copy is already the
   latest). It doesn't matter who hosted last or how long ago - nothing to plan in the group chat.
 - Friends connect the fastest way their networks allow, automatically: **direct** via UPnP port
@@ -25,25 +25,25 @@ Nothing to set up first - every fresh install already points at a free, always-o
 coordinator, so there's no server to rent or config file to edit before you start.
 
 1. Install [Fabric Loader](https://fabricmc.net/use/) and
-   [Fabric API](https://modrinth.com/mod/fabric-api) for Minecraft 1.20.1, then drop the Campfire
+   [Fabric API](https://modrinth.com/mod/fabric-api) for Minecraft 1.20.1, then drop the Campfyre
    jar into your `mods` folder.
-2. On the title screen, click the **Campfire** flame button (next to the language button).
-3. **One person** clicks *Light a New Campfire* and *Light It* - that's it, no address to type
+2. On the title screen, click the **Campfyre** flame button (next to the language button).
+3. **One person** clicks *Light a New Campfyre* and *Light It* - that's it, no address to type
    unless you want one (see "Running your own coordinator" below). You'll get an invite like
-   `HYHHAU4STA@campfire-coordinator.example.workers.dev` - copy it and send it to your friends.
-4. **Everyone else** clicks *Join a Campfire* and pastes the invite. That's it - the invite carries
+   `HYHHAU4STA@campfyre-coordinator.example.workers.dev` - copy it and send it to your friends.
+4. **Everyone else** clicks *Join a Campfyre* and pastes the invite. That's it - the invite carries
    everything needed, no config editing.
-5. The creator clicks **Create the Shared World** on the Campfire screen, names the world whatever
+5. The creator clicks **Create the Shared World** on the Campfyre screen, names the world whatever
    they like (the name travels with the save to every future host), and it builds and opens in one
-   click. When someone's hosting, everyone else's Campfire screen offers **Join _name_'s World**.
+   click. When someone's hosting, everyone else's Campfyre screen offers **Join _name_'s World**.
 
 Launching Minecraft never opens anything by itself - the game always starts fresh at the normal
-title screen, and Campfire waits until you come to it. The Campfire screen (the flame button, or
+title screen, and Campfyre waits until you come to it. The Campfyre screen (the flame button, or
 press **B** in-game) is your group's home: it shows whether you're connected, who's around the
 fire right now and who's away ("seen 2h ago"), who's hosting, and always offers the one action
 that makes sense next. In-game, a small badge appears in the corner for a few seconds whenever
 something changes - who you're hosting for, whose camp you're at, direct connection or relay -
-then fades out of your way. You'll also get a quiet popup (with a little campfire crackle) when a
+then fades out of your way. You'll also get a quiet popup (with a little campfyre crackle) when a
 friend joins or leaves, when someone opens the world, when hosting passes to someone, and when
 you're next in line to host.
 
@@ -57,7 +57,7 @@ The coordinator is just a "phone book" - it never runs Minecraft or simulates th
 tracks whose turn it is to host and ferries the save + game traffic between you. You don't need to
 run one yourself; every install already uses a free shared coordinator by default. Some groups
 prefer to run their own anyway - more control, no reliance on a server you don't own, useful if
-your group is especially large or active. If that's you, whoever clicks *Light a New Campfire* can
+your group is especially large or active. If that's you, whoever clicks *Light a New Campfyre* can
 type a different coordinator address before creating the group, and that address travels with the
 invite to everyone else automatically - nobody else has to configure anything. See
 [coordinator/coordinator/DEPLOY.md](coordinator/coordinator/DEPLOY.md) for self-hosting options.

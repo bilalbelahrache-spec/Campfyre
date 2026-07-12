@@ -194,7 +194,7 @@ function getGroup(groupId) {
       modHashes: new Map(),
       // playerId -> string[] of "id@version" entries (same list modHashes
       // was hashed from), from each 'hello'. The hash alone can only say
-      // "differs" - this is what lets CampfireModsScreen say WHICH mods, so
+      // "differs" - this is what lets CampfyreModsScreen say WHICH mods, so
       // a crash from a missing/mismatched content mod is actually
       // diagnosable instead of just flagged. Opaque display data as far as
       // the coordinator's concerned - same "never inspects payloads"
@@ -209,7 +209,7 @@ function getGroup(groupId) {
       hostDirectAddress: null,
       // The group's original creator - set once, on whichever 'hello' the
       // coordinator sees first for this groupId, and never changed again
-      // (not even if that player leaves for good - see CampfireClient's
+      // (not even if that player leaves for good - see CampfyreClient's
       // World Settings screen, the only thing that reads this). Distinct
       // from hostId, which rotates every session.
       ownerId: null,
@@ -1046,7 +1046,7 @@ function handleDeparture(groupId, playerId, ws) {
 // multer defaults to MemoryStorage when given no storage/dest option, which
 // buffers the ENTIRE upload (up to the 2GB limit below) in process RAM
 // before the route handler ever runs. On a typical small self-host VPS
-// (512MB-1GB), two campfires migrating hosts around the same time can stage
+// (512MB-1GB), two campfyres migrating hosts around the same time can stage
 // two ~1-1.5GB uploads at once and OOM-kill the single Node process,
 // dropping every group at once - not just the two involved, and not even
 // requiring malice, just normal play at realistic world sizes. diskStorage
@@ -1276,7 +1276,7 @@ app.get('/groups/:groupId/save', (req, res) => {
   res.download(filePath, `${groupId}.zip`);
 });
 
-// Lets a friend's "Join a Campfire" screen check a code before committing to
+// Lets a friend's "Join a Campfyre" screen check a code before committing to
 // it. getGroup() lazily creates a group on the first 'hello' regardless of
 // whether that code was ever really handed out by anyone - so a typo'd or
 // made-up (but still validly-charset) code would otherwise silently spin up
@@ -1292,9 +1292,9 @@ app.get('/groups/:groupId/exists', (req, res) => {
   res.json({ exists: hasSave || groups.has(groupId) });
 });
 
-// Ambient presence for the mod's "Your Campfires" list screen: who's online
+// Ambient presence for the mod's "Your Campfyres" list screen: who's online
 // and who's hosting in a group WITHOUT joining its websocket (a client only
-// ever holds one live websocket - its active campfire - but the list screen
+// ever holds one live websocket - its active campfyre - but the list screen
 // shows all of them). Read-only on purpose: never getGroup() (a poll must
 // not lazily create groups), never restoreFromTrashIfNeeded (a passive
 // look-in isn't the "they're back" signal that justifies un-archiving).

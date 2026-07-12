@@ -1,4 +1,4 @@
-# Campfire coordinator (Cloudflare Workers)
+# Campfyre coordinator (Cloudflare Workers)
 
 The coordinator, rebuilt to run on Cloudflare's free plan: no server process to keep alive, no
 sleep/wake delay, no credit card, and it scales per-group automatically (each group lives in its own
@@ -24,7 +24,7 @@ npx wrangler deploy
 ```
 
 First time, wrangler opens a browser to log in to (or create) a free Cloudflare account. The deploy
-prints the public URL (`https://campfire-coordinator.<account>.workers.dev`) - that's the
+prints the public URL (`https://campfyre-coordinator.<account>.workers.dev`) - that's the
 coordinator address.
 
 ## Differences from the Node coordinator

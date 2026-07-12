@@ -1,4 +1,4 @@
-// Front door for the Campfire coordinator on Cloudflare Workers. This layer
+// Front door for the Campfyre coordinator on Cloudflare Workers. This layer
 // is stateless: it validates ids, answers the couple of endpoints that
 // aren't about any particular group, and forwards everything else -
 // including the WebSocket upgrade - to the group's own Durable Object
@@ -9,7 +9,7 @@
 //   GET  /reflect                    caller's address as seen from outside their NAT
 //   POST /groups/new                 mint a fresh unguessable group id (rate limited per IP)
 //   GET  /groups/:id/exists          pre-join check ("is this code real?")
-//   GET  /groups/:id/status          read-only presence for the campfire list screen
+//   GET  /groups/:id/status          read-only presence for the campfyre list screen
 //   GET  /groups/:id/save            download the current save zip
 //   POST /groups/:id/save            legacy one-shot upload (multipart; small saves only -
 //                                    Cloudflare rejects request bodies over ~100MB)
@@ -25,10 +25,10 @@
 // groupId too, and the Node server ignores unknown query params - so a mod
 // that always appends ?group= works against either coordinator.
 
-import { CampfireGroup, isValidGroupId } from './group.js';
+import { CampfyreGroup, isValidGroupId } from './group.js';
 import { MintLimiter, IpRateLimiter } from './limiter.js';
 
-export { CampfireGroup, MintLimiter, IpRateLimiter };
+export { CampfyreGroup, MintLimiter, IpRateLimiter };
 
 const VERSION = '0.1.0';
 
@@ -48,7 +48,7 @@ function groupStub(env, groupId) {
 
 // See IpRateLimiter in limiter.js. bucket keeps cheap reads (exists/status)
 // and large downloads on independent per-IP budgets instead of one shared
-// counter, so a player with several campfires polling the list screen can't
+// counter, so a player with several campfyres polling the list screen can't
 // eat into the much stricter save-download allowance.
 async function checkReadRateLimit(env, ip, bucket, limit, windowMs) {
   if (!env.READ_LIMITER) return true; // defensive; should always be bound

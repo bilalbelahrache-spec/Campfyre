@@ -1,4 +1,4 @@
-// One Durable Object instance per friend group ("campfire"). This is the
+// One Durable Object instance per friend group ("campfyre"). This is the
 // Cloudflare port of the Node coordinator's per-group logic (see
 // coordinator/coordinator/server.js, which remains the reference for the
 // protocol): a phone book (who's online, whose turn to host), a dead-drop
@@ -70,7 +70,7 @@ const MAX_REMEMBERED_NAMES = 200;
 // Cap on concurrently-CONNECTED members. pruneRememberedNames only evicts
 // players who've actually left (this.members no longer has them) - nothing
 // bounded how many could be simultaneously "hello'd" at once. A real
-// campfire is a small friend group (the whole feature this coordinator
+// campfyre is a small friend group (the whole feature this coordinator
 // exists for), so this is generous headroom above any real use, not a
 // meaningful limit on legitimate play: a group id is its own access control
 // (see index.js), so anyone who has a leaked/guessed code could otherwise
@@ -91,7 +91,7 @@ const DEFAULT_META = {
   // The group's original creator - set once, on whichever 'hello' this
   // Durable Object sees first, and never changed again. Distinct from
   // hostId, which rotates every session. See group.js's hello handler and
-  // CampfireClient's World Settings screen (the only thing that reads this).
+  // CampfyreClient's World Settings screen (the only thing that reads this).
   ownerId: null,
   ownerName: null,
   // Opaque snapshot (gamerules/difficulty/time/weather) reported by
@@ -110,7 +110,7 @@ const DEFAULT_META = {
   modHashes: {},
   // playerId -> string[] of "id@version" entries (same list modHashes was
   // hashed from), from each 'hello'. The hash alone can only say "differs" -
-  // this is what lets CampfireModsScreen say WHICH mods, so a crash from a
+  // this is what lets CampfyreModsScreen say WHICH mods, so a crash from a
   // missing/mismatched content mod is actually diagnosable instead of just
   // flagged. Capped hard on ingestion (see the hello handler) - Durable
   // Object storage values cap at 2MB, and `meta` is one stored blob shared
@@ -148,7 +148,7 @@ function arrayBufferToBase64(buf) {
   return btoa(binary);
 }
 
-export class CampfireGroup {
+export class CampfyreGroup {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
@@ -378,7 +378,7 @@ export class CampfireGroup {
       // sees - every hello against an already-real group (a stuck
       // reconnect loop, or a script) was completely unthrottled. A generous
       // cap: real reconnect behavior (keepalive/retry-on-drop) is nowhere
-      // close to this even with several campfires open.
+      // close to this even with several campfyres open.
       if (!(await this.checkGeneralRateLimit(att.ip))) {
         this.log(`rejected hello - IP ${att.ip || 'unknown'} is over the general rate limit`);
         return this.send(ws, { type: 'error', reason: 'rate_limited' });
