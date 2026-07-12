@@ -257,23 +257,32 @@ export class CampfireGroup {
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
-    const path = url.pathname;
-    if (path === '/exists') return this.handleExists();
-    if (path === '/status') return this.handleStatus();
-    if (path === '/save' && request.method === 'GET') return this.handleDownload();
-    if (path === '/save' && request.method === 'POST') return this.handleLegacyUpload(request);
-    if (path === '/save/begin' && request.method === 'POST') return this.handleUploadBegin(request);
-    if (path.startsWith('/save/part/') && request.method === 'PUT') return this.handleUploadPart(request, url);
-    if (path === '/save/commit' && request.method === 'POST') return this.handleUploadCommit(request);
-    // The outer Worker pokes this before it starts reading a legacy upload
-    // body off the wire, so migration gating knows an upload is coming even
-    // before its bytes finish arriving.
-    if (path === '/save/incoming' && request.method === 'POST') {
-      meta.lastUploadActivityMs = Date.now();
-      await this.saveMeta();
-      return Response.json({ ok: true });
+    try {
+      const path = url.pathname;
+      if (path === '/exists') return await this.handleExists();
+      if (path === '/status') return await this.handleStatus();
+      if (path === '/save' && request.method === 'GET') return await this.handleDownload();
+      if (path === '/save' && request.method === 'POST') return await this.handleLegacyUpload(request);
+      if (path === '/save/begin' && request.method === 'POST') return await this.handleUploadBegin(request);
+      if (path.startsWith('/save/part/') && request.method === 'PUT') return await this.handleUploadPart(request, url);
+      if (path === '/save/commit' && request.method === 'POST') return await this.handleUploadCommit(request);
+      // The outer Worker pokes this before it starts reading a legacy upload
+      // body off the wire, so migration gating knows an upload is coming even
+      // before its bytes finish arriving.
+      if (path === '/save/incoming' && request.method === 'POST') {
+        meta.lastUploadActivityMs = Date.now();
+        await this.saveMeta();
+        return Response.json({ ok: true });
+      }
+      return Response.json({ error: 'not found' }, { status: 404 });
+    } catch (err) {
+      // Mirrors webSocketMessage's own catch below - an unexpected throw
+      // (a client aborting mid-body, a malformed multipart form, etc.)
+      // otherwise surfaced as a raw unhandled exception instead of a clean
+      // JSON error.
+      this.log(`error handling ${request.method} ${url.pathname}: ${err && err.stack ? err.stack : err}`);
+      return Response.json({ error: 'server_error' }, { status: 500 });
     }
-    return Response.json({ error: 'not found' }, { status: 404 });
   }
 
   // ---- WebSocket protocol (same messages as the Node coordinator) ----
@@ -363,6 +372,15 @@ export class CampfireGroup {
       }
       if (!(await this.checkGroupCreationAllowed(att.ip))) {
         this.log(`rejected hello that would create a new group - IP ${att.ip || 'unknown'} is over the group-creation rate limit`);
+        return this.send(ws, { type: 'error', reason: 'rate_limited' });
+      }
+      // checkGroupCreationAllowed only gates the FIRST hello a group ever
+      // sees - every hello against an already-real group (a stuck
+      // reconnect loop, or a script) was completely unthrottled. A generous
+      // cap: real reconnect behavior (keepalive/retry-on-drop) is nowhere
+      // close to this even with several campfires open.
+      if (!(await this.checkGeneralRateLimit(att.ip))) {
+        this.log(`rejected hello - IP ${att.ip || 'unknown'} is over the general rate limit`);
         return this.send(ws, { type: 'error', reason: 'rate_limited' });
       }
       const playerId = msg.playerId;
@@ -470,7 +488,11 @@ export class CampfireGroup {
     if (msg.type === 'direct_address') {
       // Only the current host is trusted to set this.
       if (playerId !== meta.hostId) return;
-      meta.hostDirectAddress = typeof msg.address === 'string' ? msg.address : null;
+      // Same storage-capped-`meta`-blob risk as world_settings_report below:
+      // a real ip:port is tiny, so anything long is a bug or hostile input,
+      // not a legitimate address.
+      const addr = typeof msg.address === 'string' ? msg.address : null;
+      meta.hostDirectAddress = (addr && addr.length <= 256) ? addr : null;
       await this.saveMeta();
       this.broadcast({ type: 'host_direct_address', address: meta.hostDirectAddress }, playerId);
       this.log(`host direct address: ${meta.hostDirectAddress || '(none - UPnP unavailable)'}`);
@@ -705,6 +727,21 @@ export class CampfireGroup {
     }
   }
 
+  // The HTTP upload routes have no persistent connection to carry an
+  // identity the way the WebSocket path does (see save_upload_begin's
+  // meta.lastHostId check above), so callers must attach their playerId as a
+  // query param and it's checked the same way: only the most recently
+  // designated host may upload, and only once a host has actually been
+  // designated. Anyone who has ever seen a group's invite code could
+  // otherwise call these directly (no mod required, a stranger's curl works
+  // fine) and silently overwrite or hijack the group's only save at any
+  // time - this used to check nothing at all.
+  authorizedUploader(request, meta) {
+    const url = new URL(request.url);
+    const playerId = url.searchParams.get('playerId');
+    return !!playerId && !!meta.lastHostId && playerId === meta.lastHostId;
+  }
+
   relayToHost(fromPlayerId, msg) {
     const hostWs = this.meta.hostId ? this.members.get(this.meta.hostId) : null;
     if (!hostWs) {
@@ -867,6 +904,16 @@ export class CampfireGroup {
     return res.status !== 429;
   }
 
+  // General per-IP hello throttle - see IpRateLimiter in limiter.js and the
+  // matching read/download limits in index.js.
+  async checkGeneralRateLimit(ip) {
+    if (!this.env.READ_LIMITER) return true; // defensive; should always be bound
+    const key = `${ip || 'unknown'}:hello`;
+    const res = await this.env.READ_LIMITER.get(this.env.READ_LIMITER.idFromName(key))
+      .fetch('https://limiter/check?limit=120&windowMs=60000');
+    return res.status !== 429;
+  }
+
   async handleExists() {
     const meta = await this.loaded();
     const save = await this.currentSave();
@@ -957,6 +1004,10 @@ export class CampfireGroup {
     if (!(await this.checkGroupCreationAllowed(request.headers.get('CF-Connecting-IP')))) {
       return Response.json({ error: 'rate limited' }, { status: 429 });
     }
+    const meta = await this.loaded();
+    if (!this.authorizedUploader(request, meta)) {
+      return Response.json({ error: 'not host' }, { status: 403 });
+    }
     const buf = new Uint8Array(await request.arrayBuffer());
     // Never let garbage replace the only copy of a world: every zip starts "PK".
     if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
@@ -976,6 +1027,9 @@ export class CampfireGroup {
     if (!(await this.checkGroupCreationAllowed(request.headers.get('CF-Connecting-IP')))) {
       return Response.json({ error: 'rate limited' }, { status: 429 });
     }
+    if (!this.authorizedUploader(request, meta)) {
+      return Response.json({ error: 'not host' }, { status: 403 });
+    }
     // Same concurrent-upload cap as the WebSocket path - see save_upload_begin.
     const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
     if (existing.size > 0) {
@@ -991,6 +1045,9 @@ export class CampfireGroup {
 
   async handleUploadPart(request, url) {
     const meta = await this.loaded();
+    if (!this.authorizedUploader(request, meta)) {
+      return Response.json({ error: 'not host' }, { status: 403 });
+    }
     const uploadId = url.searchParams.get('uploadId') || '';
     const partIndex = Number(url.pathname.split('/').pop());
     const staging = await this.ctx.storage.get(`staging:${uploadId}`);
@@ -1035,6 +1092,10 @@ export class CampfireGroup {
   }
 
   async handleUploadCommit(request) {
+    const meta = await this.loaded();
+    if (!this.authorizedUploader(request, meta)) {
+      return Response.json({ error: 'not host' }, { status: 403 });
+    }
     let body;
     try {
       body = await request.json();

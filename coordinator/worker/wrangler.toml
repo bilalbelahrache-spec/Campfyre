@@ -17,8 +17,18 @@ class_name = "CampfireGroup"
 name = "LIMITER"
 class_name = "MintLimiter"
 
+# General per-IP limiter for the read/download endpoints and WS 'hello'
+# against an existing group - see IpRateLimiter in limiter.js.
+[[durable_objects.bindings]]
+name = "READ_LIMITER"
+class_name = "IpRateLimiter"
+
 # SQLite-backed storage is what's available on the free plan (and what the
 # save-chunk storage assumes).
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CampfireGroup", "MintLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["IpRateLimiter"]

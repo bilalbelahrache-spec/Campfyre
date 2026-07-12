@@ -26,9 +26,9 @@
 // that always appends ?group= works against either coordinator.
 
 import { CampfireGroup, isValidGroupId } from './group.js';
-import { MintLimiter } from './limiter.js';
+import { MintLimiter, IpRateLimiter } from './limiter.js';
 
-export { CampfireGroup, MintLimiter };
+export { CampfireGroup, MintLimiter, IpRateLimiter };
 
 const VERSION = '0.1.0';
 
@@ -44,6 +44,18 @@ function generateGroupCode() {
 
 function groupStub(env, groupId) {
   return env.GROUPS.get(env.GROUPS.idFromName(groupId));
+}
+
+// See IpRateLimiter in limiter.js. bucket keeps cheap reads (exists/status)
+// and large downloads on independent per-IP budgets instead of one shared
+// counter, so a player with several campfires polling the list screen can't
+// eat into the much stricter save-download allowance.
+async function checkReadRateLimit(env, ip, bucket, limit, windowMs) {
+  if (!env.READ_LIMITER) return true; // defensive; should always be bound
+  const key = `${ip || 'unknown'}:${bucket}`;
+  const res = await env.READ_LIMITER.get(env.READ_LIMITER.idFromName(key))
+    .fetch(`https://limiter/check?limit=${limit}&windowMs=${windowMs}`);
+  return res.status !== 429;
 }
 
 // Forward a request to a group's Durable Object with the /groups/:id prefix
@@ -123,7 +135,12 @@ export default {
       // gating knows an upload is underway even while the body is still
       // arriving.
       if (rest === '/save' && request.method === 'POST') {
-        await forwardToGroup(env, groupId, request, '/save/incoming', { method: 'POST' });
+        // Both forwards must carry the original headers through - without
+        // them the Durable Object never sees CF-Connecting-IP (it was
+        // dropped here before), so its rate-limit check for a brand-new
+        // group's first upload collapsed every caller worldwide into one
+        // shared 'unknown' bucket instead of limiting per IP.
+        await forwardToGroup(env, groupId, request, '/save/incoming', { method: 'POST', headers: request.headers });
         let file;
         try {
           const form = await request.formData();
@@ -136,6 +153,7 @@ export default {
         }
         return forwardToGroup(env, groupId, request, '/save', {
           method: 'POST',
+          headers: request.headers,
           body: await file.arrayBuffer(),
         });
       }
@@ -143,6 +161,19 @@ export default {
       const known = rest === '/exists' || rest === '/status' || rest === '/save'
         || rest === '/save/begin' || rest === '/save/commit' || /^\/save\/part\/\d+$/.test(rest);
       if (known) {
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+        // Everything reaching here (POST /save already returned above) is a
+        // cheap read except a GET /save download, which is capped far
+        // tighter since it can be tens of MB per request.
+        if (rest === '/exists' || rest === '/status') {
+          if (!(await checkReadRateLimit(env, ip, 'read', 300, 60000))) {
+            return Response.json({ error: 'rate limited' }, { status: 429 });
+          }
+        } else if (rest === '/save' && request.method === 'GET') {
+          if (!(await checkReadRateLimit(env, ip, 'download', 30, 60000))) {
+            return Response.json({ error: 'rate limited' }, { status: 429 });
+          }
+        }
         return forwardToGroup(env, groupId, request, rest);
       }
     }

@@ -112,7 +112,7 @@ const FAKE_ZIP = Buffer.concat([
   console.log('--- legacy one-shot save upload ---');
   const form = new FormData();
   form.append('save', new Blob([FAKE_ZIP], { type: 'application/zip' }), 'save.zip');
-  const up1 = await (await fetch(`${BASE}/groups/${groupId}/save`, { method: 'POST', body: form })).json();
+  const up1 = await (await fetch(`${BASE}/groups/${groupId}/save?playerId=alice`, { method: 'POST', body: form })).json();
   check('legacy upload -> v1', up1.ok === true && up1.saveVersion === 1, JSON.stringify(up1));
   await sleep(300);
   check('save_ready broadcast', bob.received.some((m) => m.type === 'save_ready' && m.saveVersion === 1));
@@ -123,21 +123,21 @@ const FAKE_ZIP = Buffer.concat([
   console.log('--- garbage upload is rejected ---');
   const badForm = new FormData();
   badForm.append('save', new Blob([Buffer.from('this is not a zip')]), 'save.zip');
-  const bad = await fetch(`${BASE}/groups/${groupId}/save`, { method: 'POST', body: badForm });
+  const bad = await fetch(`${BASE}/groups/${groupId}/save?playerId=alice`, { method: 'POST', body: badForm });
   check('non-zip rejected with 400', bad.status === 400);
 
   console.log('--- chunked save upload ---');
-  const { uploadId } = await (await fetch(`${BASE}/groups/${groupId}/save/begin`, { method: 'POST' })).json();
+  const { uploadId } = await (await fetch(`${BASE}/groups/${groupId}/save/begin?playerId=alice`, { method: 'POST' })).json();
   check('begin -> uploadId', typeof uploadId === 'string');
   const half = Math.ceil(FAKE_ZIP.length / 2);
   for (const [i, part] of [FAKE_ZIP.subarray(0, half), FAKE_ZIP.subarray(half)].entries()) {
-    const r = await (await fetch(`${BASE}/groups/${groupId}/save/part/${i}?uploadId=${uploadId}`, {
+    const r = await (await fetch(`${BASE}/groups/${groupId}/save/part/${i}?uploadId=${uploadId}&playerId=alice`, {
       method: 'PUT',
       body: part,
     })).json();
     check(`part ${i} accepted`, r.ok === true, JSON.stringify(r));
   }
-  const commit = await (await fetch(`${BASE}/groups/${groupId}/save/commit`, {
+  const commit = await (await fetch(`${BASE}/groups/${groupId}/save/commit?playerId=alice`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uploadId, parts: 2 }),

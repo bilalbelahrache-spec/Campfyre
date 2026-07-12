@@ -39,3 +39,47 @@ export class MintLimiter {
     }
   }
 }
+
+// General per-IP sliding-window limiter for everything else that was
+// completely unthrottled: GET /exists, /status, /save (download), and WS
+// 'hello' against an already-existing group (see group.js's checkGeneralRate
+// -Limit). Those all skip checkGroupCreationAllowed entirely once a group
+// is real, so a stuck reconnect loop or a deliberately hostile script could
+// otherwise hammer them without limit - and because this whole coordinator
+// runs on one shared free-tier account, burning through its daily request
+// budget this way takes the service down for every unrelated public group,
+// not just the caller's own.
+//
+// One instance per (ip, bucket) pair - callers key the DO name as
+// `${ip}:${bucket}` so different endpoint classes (cheap reads vs. large
+// downloads) get independent budgets instead of sharing one counter. limit/
+// windowMs travel as query params so this one class serves every bucket
+// without a wrangler.toml binding per policy.
+export class IpRateLimiter {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const limit = Number(url.searchParams.get('limit')) || 60;
+    const windowMs = Number(url.searchParams.get('windowMs')) || 60000;
+    const now = Date.now();
+    const times = ((await this.ctx.storage.get('times')) || []).filter((t) => now - t < windowMs);
+    if (times.length >= limit) {
+      return new Response('rate limited', { status: 429 });
+    }
+    times.push(now);
+    await this.ctx.storage.put('times', times);
+    await this.ctx.storage.setAlarm(now + windowMs + 60000);
+    return Response.json({ ok: true });
+  }
+
+  async alarm() {
+    // No per-bucket window recorded here (limit/windowMs only ever arrive on
+    // fetch()) - just drop everything once nothing has hit this IP+bucket
+    // recently. A safe, generous default: if it's been quiet a full minute
+    // past whatever the last request's window was, it's idle either way.
+    await this.ctx.storage.deleteAll();
+  }
+}
