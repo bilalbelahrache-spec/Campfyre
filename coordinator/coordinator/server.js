@@ -38,10 +38,37 @@ process.on('unhandledRejection', (reason) => {
 });
 
 const PORT = process.env.PORT || 8080;
+// Every rate limit in this file (group-creation mint, upload-in-flight
+// tracking, WS connection identity) keys on req.socket.remoteAddress, which
+// is only the real caller's address for a DIRECTLY-exposed coordinator. A
+// self-hoster running this behind nginx/Caddy/Cloudflare Tunnel/ngrok for
+// TLS or NAT reasons (a normal way to expose "a different coordinator
+// address" per the README's join flow) makes every request look like it
+// came from the proxy - collapsing every real client into one shared rate-
+// limit bucket (a handful of friends minting their own groups the same day
+// could lock out the whole server), or worse, if the proxy's own address
+// were trusted by default, an actual attacker could just set their own
+// X-Forwarded-For and always dodge the limit. Never trusted unless the
+// operator explicitly opts in, since a NON-proxied deploy would otherwise
+// let any client spoof this header to reset its own rate limit for free.
+const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
+function clientIp(req) {
+  if (TRUST_PROXY) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) return forwarded.split(',')[0].trim();
+  }
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
 const SAVES_DIR = path.join(__dirname, 'saves');
 const TRASH_DIR = path.join(SAVES_DIR, '_trash');
+// Scratch space for in-progress WebSocket-transport uploads - each part
+// lands in its own small file here (see 'save_upload_part' below) instead
+// of being buffered in process memory, so a multi-GB save transfer never
+// costs more than one part's worth of RAM at a time.
+const WS_CHUNKS_DIR = path.join(SAVES_DIR, '_ws_chunks');
 fs.mkdirSync(SAVES_DIR, { recursive: true });
 fs.mkdirSync(TRASH_DIR, { recursive: true });
+fs.mkdirSync(WS_CHUNKS_DIR, { recursive: true });
 
 // How long to wait for the outgoing host's save upload to land before
 // migrating anyway with whatever save version we've got. This is what
@@ -137,7 +164,17 @@ function isValidPlayerId(id) {
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+// ws defaults to a 100MB maxPayload - far larger than any legitimate
+// message needs, given the protocol's own 512KB chunking
+// (WS_TRANSFER_PART_BYTES) plus base64's ~33% inflation and JSON overhead.
+// This is a single Node process serving every self-hosted group at once, so
+// one connection in one small friend group sending a near-100MB frame would
+// cost a synchronous multi-hundred-MB JSON.parse() that blocks the whole
+// event loop - delaying relay traffic, heartbeats, and message handling for
+// every OTHER unrelated group on the same box. Comfortably above the
+// largest real message with headroom, nowhere near the old default.
+const WS_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD_BYTES });
 
 // groupId -> { members: Map<playerId, ws>, queue: [playerId,...], hostId: string|null,
 //              saveVersion: number, pendingMigration: { timer } | null }
@@ -224,8 +261,22 @@ function getGroup(groupId) {
   return groups.get(groupId);
 }
 
+// A friend on a slow/lossy connection who stops draining their socket used
+// to let the host's live relay_data traffic queue up in ws.bufferedAmount
+// without any limit, for as long as the session ran - nothing checked it
+// before sending more. Only applied to relay_data specifically: it fires
+// once per network chunk of live gameplay and games already tolerate a lost
+// packet, so dropping new frames for a badly backed-up peer is strictly
+// better than an unbounded memory leak. Control messages (state/migrate/
+// error/etc.) are rare and important enough to always attempt regardless.
+const RELAY_BACKPRESSURE_THRESHOLD_BYTES = 4 * 1024 * 1024;
+
 function send(ws, msg) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+  if (ws.readyState !== ws.OPEN) return;
+  if (msg.type === 'relay_data' && ws.bufferedAmount > RELAY_BACKPRESSURE_THRESHOLD_BYTES) {
+    return; // stalled reader - drop this frame rather than growing the queue further
+  }
+  ws.send(JSON.stringify(msg));
 }
 
 function broadcast(group, msg, exceptId = null) {
@@ -401,7 +452,7 @@ function relayToPlayer(group, toPlayerId, msg) {
 wss.on('connection', (ws, req) => {
   let groupId = null;
   let playerId = null;
-  const remoteIp = (req && req.socket && req.socket.remoteAddress) || 'unknown';
+  const remoteIp = req ? clientIp(req) : 'unknown';
 
   // Heartbeat bookkeeping (see HEARTBEAT_INTERVAL_MS). Any sign of life
   // counts: a pong reply to our ping, the client's OWN keepalive pings
@@ -411,8 +462,29 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('ping', () => { ws.isAlive = true; });
 
+  // Per-connection message-rate guard, alongside the maxPayload cap above -
+  // there was previously no throttling at all beyond the per-message
+  // try/catch. Generous enough that real high-frequency relay_data traffic
+  // during actual gameplay is nowhere close to it; this exists only to stop
+  // one flooding connection from burying the shared, single-threaded event
+  // loop in synchronous JSON.parse() calls at every OTHER group's expense.
+  const MSG_RATE_LIMIT_PER_SEC = 1000;
+  let msgWindowStart = Date.now();
+  let msgWindowCount = 0;
+
   ws.on('message', async (raw) => {
     ws.isAlive = true;
+    const nowMs = Date.now();
+    if (nowMs - msgWindowStart >= 1000) {
+      msgWindowStart = nowMs;
+      msgWindowCount = 0;
+    }
+    msgWindowCount += 1;
+    if (msgWindowCount > MSG_RATE_LIMIT_PER_SEC) {
+      log(`[${groupId || 'pre-hello'}] terminating connection from ${remoteIp} - exceeded ${MSG_RATE_LIMIT_PER_SEC} messages/sec`);
+      ws.terminate();
+      return;
+    }
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -640,7 +712,17 @@ wss.on('connection', (ws, req) => {
       // this group - including the new host's own first upload - being
       // rejected with upload_already_in_progress for up to the full
       // WS_UPLOAD_ABANDON_MS (10 minute) sweep window.
-      group.activeUploads.set(uploadId, { parts: [], size: 0, startedAt: Date.now(), ws });
+      //
+      // Each part lands in its own file under a per-upload scratch
+      // directory (see 'save_upload_part') instead of an in-memory `parts`
+      // array - this used to buffer the ENTIRE save in process RAM before
+      // ever touching disk, and on a typical small self-host VPS two
+      // migrations landing around the same time (two multi-hundred-MB to
+      // multi-GB uploads at once) could OOM-kill the single Node process,
+      // dropping every group at once. Peak memory per upload is now one
+      // part's worth (WS_TRANSFER_PART_BYTES, 512KB), not the whole file.
+      fs.mkdirSync(wsUploadChunkDir(uploadId), { recursive: true });
+      group.activeUploads.set(uploadId, { receivedIndices: new Set(), partCount: 0, size: 0, startedAt: Date.now(), ws });
       group.uploadsInFlight += 1;
       group.lastUploadActivityMs = Date.now();
       send(ws, { type: 'save_upload_begin_ack', uploadId });
@@ -659,18 +741,30 @@ wss.on('connection', (ws, req) => {
         return;
       }
       // Overwriting the same index again (a retried part) is harmless - the
-      // same bytes just land in the same slot.
+      // same bytes just land in the same file.
       const buf = Buffer.from(msg.data, 'base64');
-      const previous = up.parts[msg.index];
-      up.size += buf.length - (previous ? previous.length : 0);
+      const partPath = path.join(wsUploadChunkDir(msg.uploadId), String(msg.index));
+      let previousSize = 0;
+      if (up.receivedIndices.has(msg.index)) {
+        try { previousSize = fs.statSync(partPath).size; } catch { /* treat as 0 */ }
+      }
+      up.size += buf.length - previousSize;
       if (up.size > WS_UPLOAD_MAX_BYTES) {
-        group.activeUploads.delete(msg.uploadId);
-        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+        discardUpload(group, msg.uploadId);
         log(`[${groupId}] rejected websocket save upload - exceeded ${WS_UPLOAD_MAX_BYTES / 1024 / 1024 / 1024}GB cap`);
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'too_large' });
         return;
       }
-      up.parts[msg.index] = buf;
+      try {
+        fs.writeFileSync(partPath, buf);
+      } catch (e) {
+        discardUpload(group, msg.uploadId);
+        log(`[${groupId}] websocket save upload failed writing part ${msg.index}: ${e.message}`);
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'write_failed' });
+        return;
+      }
+      up.receivedIndices.add(msg.index);
+      up.partCount = Math.max(up.partCount, msg.index + 1);
       send(ws, { type: 'save_upload_part_ack', uploadId: msg.uploadId, index: msg.index });
       return;
     }
@@ -681,6 +775,17 @@ wss.on('connection', (ws, req) => {
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'unknown_upload' });
         return;
       }
+      // A resent commit (e.g. its ack timed out during a slow AV-triggered
+      // rename retry) while the first commit is still mid-flight used to
+      // re-enter this whole block a second time, both racing the same
+      // concatenate/rename against the same tmp/dest paths. Same bytes, so
+      // no real corruption resulted, but the loser's rename typically failed
+      // with a spurious error anyway. Reject immediately instead.
+      if (up.committing) {
+        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'commit_in_progress' });
+        return;
+      }
+      up.committing = true;
       group.lastUploadActivityMs = Date.now();
       // The activeUploads entry (and the "another upload can't start" lock
       // save_upload_begin checks via activeUploads.size) used to be released
@@ -693,22 +798,11 @@ wss.on('connection', (ws, req) => {
       // logical upload. The lock now stays held for the actual duration it
       // exists to serialize - released only once below, after the write
       // (success OR failure) has genuinely finished.
-      const releaseUploadLock = () => {
-        group.activeUploads.delete(msg.uploadId);
-        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
-      };
+      const releaseUploadLock = () => discardUpload(group, msg.uploadId);
 
-      if (up.parts.some((p) => !p)) {
+      if (up.receivedIndices.size !== up.partCount) {
         releaseUploadLock();
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'missing_part' });
-        return;
-      }
-      const buf = Buffer.concat(up.parts);
-      // Same cheap sanity check as the HTTP upload: every zip starts with "PK".
-      if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
-        releaseUploadLock();
-        log(`[${groupId}] rejected websocket save upload - not a zip (${buf.length} bytes)`);
-        send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'not_a_zip' });
         return;
       }
 
@@ -716,7 +810,24 @@ wss.on('connection', (ws, req) => {
       const dest = path.join(SAVES_DIR, `${groupId}.zip`);
       const tmp = `${dest}.uploading`;
       try {
-        fs.writeFileSync(tmp, buf);
+        // Streamed straight from the per-part files into the temp file, in
+        // order - bounded memory (one part at a time), same as writing the
+        // parts out in the first place.
+        await concatPartsToFile(wsUploadChunkDir(msg.uploadId), up.partCount, tmp);
+        // Same cheap sanity check as the HTTP upload: every zip starts with
+        // "PK" - checked on the already-written temp file rather than an
+        // in-memory buffer.
+        const head = Buffer.alloc(4);
+        const fd = fs.openSync(tmp, 'r');
+        const bytesRead = fs.readSync(fd, head, 0, 4, 0);
+        fs.closeSync(fd);
+        if (bytesRead < 4 || head[0] !== 0x50 || head[1] !== 0x4b) {
+          try { fs.unlinkSync(tmp); } catch { /* sweep gets it later */ }
+          releaseUploadLock();
+          log(`[${groupId}] rejected websocket save upload - not a zip`);
+          send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'not_a_zip' });
+          return;
+        }
         await renameWithRetry(tmp, dest);
       } catch (e) {
         log(`[${groupId}] websocket save upload failed - couldn't move the new zip into place: ${e.message}`);
@@ -725,11 +836,12 @@ wss.on('connection', (ws, req) => {
         send(ws, { type: 'save_upload_error', uploadId: msg.uploadId, reason: 'write_failed' });
         return;
       }
+      const uploadedSize = up.size;
       releaseUploadLock();
 
       group.saveVersion += 1;
       broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
-      log(`[${groupId}] save uploaded over websocket (${(buf.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
+      log(`[${groupId}] save uploaded over websocket (${(uploadedSize / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
       send(ws, { type: 'save_upload_commit_ack', uploadId: msg.uploadId, saveVersion: group.saveVersion });
 
       if (group.pendingMigration) {
@@ -894,8 +1006,7 @@ function handleDeparture(groupId, playerId, ws) {
   if (ws) {
     for (const [uploadId, up] of group.activeUploads) {
       if (up.ws === ws) {
-        group.activeUploads.delete(uploadId);
-        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+        discardUpload(group, uploadId);
       }
     }
   }
@@ -932,7 +1043,24 @@ function handleDeparture(groupId, playerId, ws) {
 
 // --- Save file relay (plain HTTP, separate from the WebSocket signaling) ---
 
-const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2GB cap for now
+// multer defaults to MemoryStorage when given no storage/dest option, which
+// buffers the ENTIRE upload (up to the 2GB limit below) in process RAM
+// before the route handler ever runs. On a typical small self-host VPS
+// (512MB-1GB), two campfires migrating hosts around the same time can stage
+// two ~1-1.5GB uploads at once and OOM-kill the single Node process,
+// dropping every group at once - not just the two involved, and not even
+// requiring malice, just normal play at realistic world sizes. diskStorage
+// streams straight to disk instead. Filenames end in '.uploading' so the
+// existing cleanOrphanedUploadTemps sweep already reaps anything left behind
+// by a request that errors out (multer doesn't delete a partial file on its
+// own e.g. on a LIMIT_FILE_SIZE abort) without any changes to that sweep.
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: SAVES_DIR,
+    filename: (req, file, cb) => cb(null, `upload-${crypto.randomBytes(8).toString('hex')}.uploading`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB cap for now
+});
 
 // Chunk size for the WebSocket-transport save transfer above. Comfortably
 // under Workers' 32MB-per-message WebSocket limit even after base64's ~33%
@@ -991,6 +1119,53 @@ function renameWithRetry(src, dest, attempts = 15, delayMs = 400) {
   });
 }
 
+function wsUploadChunkDir(uploadId) {
+  return path.join(WS_CHUNKS_DIR, uploadId);
+}
+
+// Streams each part file in order into one destination file - bounded
+// memory (one part at a time), never the whole save at once. Used at
+// save_upload_commit instead of Buffer.concat()-ing every part.
+function concatPartsToFile(chunkDir, partCount, destPath) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(destPath);
+    out.on('error', reject);
+    out.on('finish', resolve);
+    const writeNext = (i) => {
+      if (i >= partCount) {
+        out.end();
+        return;
+      }
+      const partPath = path.join(chunkDir, String(i));
+      fs.readFile(partPath, (err, buf) => {
+        if (err) {
+          out.destroy();
+          reject(err);
+          return;
+        }
+        if (out.write(buf)) {
+          writeNext(i + 1);
+        } else {
+          out.once('drain', () => writeNext(i + 1));
+        }
+      });
+    };
+    writeNext(0);
+  });
+}
+
+// Releases an in-progress WebSocket-transport upload's bookkeeping AND its
+// on-disk scratch chunk files - every place that used to just delete the
+// activeUploads Map entry (too-large, write failure, commit, disconnect,
+// the abandoned-upload sweep) also needs to clean up the part files that
+// replaced the old in-memory `parts` array, or they'd sit in WS_CHUNKS_DIR
+// forever instead of being reclaimed with the upload attempt they belong to.
+function discardUpload(group, uploadId) {
+  group.activeUploads.delete(uploadId);
+  group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+  fs.rm(wsUploadChunkDir(uploadId), { recursive: true, force: true }, () => {});
+}
+
 // Runs BEFORE multer parses the body, so the group knows an upload is
 // actively streaming from the moment its first bytes arrive - that's what
 // lets the migration timeout (onPendingMigrationTimeout) hold the handoff
@@ -999,7 +1174,7 @@ function markUploadInFlight(req, res, next) {
   const { groupId } = req.params;
   if (isValidGroupId(groupId)) {
     if (!isGroupAlreadyCreated(groupId)) {
-      const ip = req.socket.remoteAddress || 'unknown';
+      const ip = clientIp(req);
       if (!isGroupCreationAllowed(ip)) {
         log(`[${groupId}] rejected upload that would create a new group - ${ip} is over the group-creation rate limit`);
         res.status(429).json({ error: 'too many new groups from this address - try again later' });
@@ -1027,6 +1202,17 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
   if (!isValidGroupId(groupId)) return res.status(400).json({ error: 'invalid group id' });
   if (!req.file) return res.status(400).json({ error: 'missing file' });
   const group = getGroup(groupId);
+  // This HTTP route had no identity check at all, unlike the WebSocket
+  // upload path (save_upload_begin's group.lastHostId check below) - a
+  // group's id is meant to be its access control for JOINING, but anyone
+  // who ever saw the invite code could otherwise call this directly (no mod
+  // needed, a stranger's curl works fine) and silently overwrite or hijack
+  // the group's only save at any time. Mirrors the WebSocket check: only
+  // the most recently designated host, and only once one exists.
+  const uploaderPlayerId = String(req.query.playerId || '');
+  if (!uploaderPlayerId || !group.lastHostId || uploaderPlayerId !== group.lastHostId) {
+    return res.status(403).json({ error: 'not host' });
+  }
   // Same lock save_upload_begin uses (activeUploads.size), from the other
   // side - see httpUploadInProgress's definition in getGroup() for why a
   // second concurrent writer here (whether another HTTP POST or a
@@ -1036,22 +1222,26 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
     return res.status(409).json({ error: 'upload already in progress' });
   }
   group.httpUploadInProgress = true;
+  const tmp = req.file.path; // already fully written to disk by multer's diskStorage
   try {
   // The stored zip is the ONLY copy of the group's world - never let
   // garbage replace it. Cheap sanity check (every zip starts with "PK"),
-  // then write-to-temp + rename so a crash/disk-full mid-write can never
-  // leave a half-written file where the good save used to be. rename() on
-  // the same filesystem is atomic; the good save exists untouched right up
-  // until the complete new one takes its place.
-  const buf = req.file.buffer;
-  if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
-    log(`[${groupId}] rejected save upload - not a zip (${buf.length} bytes)`);
+  // read straight off the already-written temp file rather than an
+  // in-memory buffer, then rename into place so a crash/disk-full mid-write
+  // can never leave a half-written file where the good save used to be.
+  // rename() on the same filesystem is atomic; the good save exists
+  // untouched right up until the complete new one takes its place.
+  const head = Buffer.alloc(4);
+  const fd = fs.openSync(tmp, 'r');
+  const bytesRead = fs.readSync(fd, head, 0, 4, 0);
+  fs.closeSync(fd);
+  if (bytesRead < 4 || head[0] !== 0x50 || head[1] !== 0x4b) {
+    log(`[${groupId}] rejected save upload - not a zip (${req.file.size} bytes)`);
+    try { fs.unlinkSync(tmp); } catch { /* sweep gets it later */ }
     return res.status(400).json({ error: 'not a zip' });
   }
   restoreFromTrashIfNeeded(groupId);
   const dest = path.join(SAVES_DIR, `${groupId}.zip`);
-  const tmp = `${dest}.uploading`;
-  fs.writeFileSync(tmp, buf);
   try {
     await renameWithRetry(tmp, dest);
   } catch (e) {
@@ -1063,7 +1253,7 @@ app.post('/groups/:groupId/save', markUploadInFlight, upload.single('save'), asy
   }
   group.saveVersion += 1;
   broadcast(group, { type: 'save_ready', saveVersion: group.saveVersion });
-  log(`[${groupId}] save uploaded (${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
+  log(`[${groupId}] save uploaded (${(req.file.size / 1024 / 1024).toFixed(1)} MB) -> v${group.saveVersion}`);
 
   // If a host departure is waiting on exactly this upload, this is the
   // signal it's been waiting for - migrate now, with the version we just set.
@@ -1172,7 +1362,7 @@ function isGroupAlreadyCreated(groupId) {
 }
 
 app.post('/groups/new', (req, res) => {
-  const ip = req.socket.remoteAddress || 'unknown';
+  const ip = clientIp(req);
   if (!isGroupCreationAllowed(ip)) {
     log(`[mint] rate-limited ${ip}`);
     return res.status(429).send('too many new groups from this address - try again later');
@@ -1257,6 +1447,25 @@ function cleanOrphanedUploadTemps() {
       log(`[cleanup] removed orphaned upload temp ${fileName}`);
     }
   }
+  // pruneAbandonedUploads only catches a dropped WebSocket-transport upload
+  // while this process's `groups` Map still remembers it - a process
+  // restart wipes that (in-memory only, like everything else here) but the
+  // scratch chunk directory it left behind under WS_CHUNKS_DIR would
+  // otherwise sit on disk forever with nothing left to sweep it.
+  for (const dirName of fs.readdirSync(WS_CHUNKS_DIR)) {
+    const dirPath = path.join(WS_CHUNKS_DIR, dirName);
+    let stat;
+    try {
+      stat = fs.statSync(dirPath);
+    } catch {
+      continue; // raced with something else removing it
+    }
+    if (!stat.isDirectory()) continue;
+    if (now - stat.mtimeMs > 10 * 60 * 1000) {
+      fs.rm(dirPath, { recursive: true, force: true }, () => {});
+      log(`[cleanup] removed orphaned websocket upload chunks ${dirName}`);
+    }
+  }
 }
 
 function pruneMintHistory() {
@@ -1269,15 +1478,15 @@ function pruneMintHistory() {
 }
 
 // A WebSocket upload whose connection dropped mid-transfer has no temp file
-// to sweep (unlike the HTTP path) - it only lives in group.activeUploads,
-// so without this it stays allocated in memory forever.
+// under SAVES_DIR to sweep (unlike the HTTP path) - it only lives in
+// group.activeUploads plus its scratch chunk files under WS_CHUNKS_DIR, so
+// without this both stay allocated (in memory AND on disk) forever.
 function pruneAbandonedUploads() {
   const now = Date.now();
   for (const [groupId, group] of groups) {
     for (const [uploadId, up] of group.activeUploads) {
       if (now - up.startedAt > WS_UPLOAD_ABANDON_MS) {
-        group.activeUploads.delete(uploadId);
-        group.uploadsInFlight = Math.max(0, group.uploadsInFlight - 1);
+        discardUpload(group, uploadId);
         log(`[${groupId}] swept abandoned websocket upload ${uploadId}`);
       }
     }
@@ -1299,6 +1508,14 @@ setInterval(() => {
 // once, answer compact JSON.
 app.use((err, req, res, next) => {
   log(`[http] ${req.method} ${req.path} failed: ${err.message}`);
+  // multer's diskStorage doesn't delete a partial file on its own when it
+  // aborts mid-stream (e.g. LIMIT_FILE_SIZE) - without this it just sits
+  // there until cleanOrphanedUploadTemps' 10-minute sweep catches it, which
+  // is a fine backstop but no reason not to clean up immediately when we
+  // already know the request failed.
+  if (req.file && req.file.path) {
+    fs.unlink(req.file.path, () => {});
+  }
   if (res.headersSent) return next(err);
   res.status(500).json({ error: err.message });
 });

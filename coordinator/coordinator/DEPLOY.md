@@ -94,4 +94,10 @@ Gotchas, in the order they actually bite people:
   loses none of the *saves*, and reconnecting clients rebuild the rest automatically.
 - There is no admin auth on the HTTP endpoints; a group's unguessable id is its access control.
   Don't put a reverse proxy path-rewrite in front of it that could leak or normalize ids.
+- If the coordinator sits behind a reverse proxy or tunnel (nginx, Caddy, Cloudflare Tunnel,
+  ngrok, etc. - common for TLS or NAT reasons), set `TRUST_PROXY=1` in its environment. Without
+  it, every request looks like it comes from the proxy's own address, which collapses the
+  per-IP rate limits (group creation, upload throttling) into one shared bucket for every real
+  visitor. Only set this if a proxy actually sits in front - otherwise a client could set its own
+  `X-Forwarded-For` header to dodge its rate limit for free.
 - Health check for uptime monitors: `GET /health`.
