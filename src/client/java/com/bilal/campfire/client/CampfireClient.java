@@ -514,8 +514,25 @@ public class CampfireClient implements ClientModInitializer {
     private volatile boolean internalRestartInProgress = false;
     private volatile CountDownLatch internalRestartLatch;
 
-    private RelayFriendListener relayFriendListener;
-    private RelayHostMultiplexer relayHostMultiplexer;
+    // Mutated from multiple threads with no prior synchronization: the
+    // WebSocket thread (state/host_confirmed -> updateHostingMode), the
+    // server-lifecycle thread (onClientJoinedWorld/onServerStopped), and the
+    // render thread (leaveGroup). volatile alone only fixes visibility, not
+    // the check-then-act races between them (e.g. a host quitting while a
+    // same-moment state broadcast has this player reclaim host), so every
+    // site that MUTATES either field also synchronizes on this object - see
+    // updateHostingMode/startFriendListenerIfNeeded and the two direct-
+    // mutation sites in leaveGroup/onServerStopped.
+    private volatile RelayFriendListener relayFriendListener;
+    private volatile RelayHostMultiplexer relayHostMultiplexer;
+
+    // Bumped every time updateHostingMode() flips us into or out of host
+    // mode. UPnP discovery alone measures ~9s (see attemptUpnpMapping) - if
+    // hosting ends before a mapping attempt that started earlier finishes,
+    // the generation captured at its start no longer matches this, which is
+    // how it knows to self-unmap instead of publishing a mapping nobody will
+    // ever call unmapPort() for again this session.
+    private final java.util.concurrent.atomic.AtomicLong hostingGeneration = new java.util.concurrent.atomic.AtomicLong();
 
     @Override
     public void onInitializeClient() {
@@ -890,9 +907,11 @@ public class CampfireClient implements ClientModInitializer {
             webSocket = null;
             sendQueue.clear();
         }
-        if (relayFriendListener != null) {
-            relayFriendListener.stop();
-            relayFriendListener = null;
+        synchronized (this) {
+            if (relayFriendListener != null) {
+                relayFriendListener.stop();
+                relayFriendListener = null;
+            }
         }
         currentHostId = null;
         members = java.util.List.of();
@@ -1264,8 +1283,10 @@ public class CampfireClient implements ClientModInitializer {
             return;
         }
 
-        if (relayHostMultiplexer != null) {
-            relayHostMultiplexer.shutdownAll();
+        synchronized (this) {
+            if (relayHostMultiplexer != null) {
+                relayHostMultiplexer.shutdownAll();
+            }
         }
 
         // Mirror of the stale-copy guard in onClientJoinedWorld: if we KNOW
@@ -1571,6 +1592,16 @@ public class CampfireClient implements ClientModInitializer {
     // round trip and no popups.
     void openManagedWorld(Screen parent) {
         MinecraftClient client = MinecraftClient.getInstance();
+        // Belt-and-suspenders alongside isPreparingWorld() now covering this
+        // (which is what actually disables the button) - a tick can elapse
+        // between the screen computing its button state and the click
+        // landing, and this is the one path (the instant no-download branch
+        // just below) with no lock of its own between the upload thread's
+        // zipDirectory() and a fresh IntegratedServer writing the same folder.
+        if (activeUploadThread != null) {
+            showMigrationToast("Still syncing this campfire", "Wait for the save upload to finish before opening the world");
+            return;
+        }
         boolean needsDownload = knownSaveVersion > 0
                 && (knownSaveVersion != localSaveVersion || !managedWorldExistsLocally());
         if (!needsDownload) {
@@ -1616,6 +1647,14 @@ public class CampfireClient implements ClientModInitializer {
             System.out.println("[Campfire] Opening the world failed: " + e);
             e.printStackTrace();
             showMigrationToast("Couldn't open the world", "Something went wrong - try again from the Campfire screen");
+            // handoffOpenPending is documented as cleared "on any world join
+            // or failed download" - but a successful download followed by
+            // THIS call throwing hit neither path (no join happened, and the
+            // download itself didn't fail), leaving it stuck true forever.
+            // The next unrelated disconnect (e.g. leaving some other vanilla
+            // server later in the session) would then spuriously try to
+            // auto-open this managed world out of nowhere.
+            handoffOpenPending = false;
         }
     }
 
@@ -1659,8 +1698,18 @@ public class CampfireClient implements ClientModInitializer {
     // race (see the stopLocalServerIfRunningManagedWorld() call inside
     // downloadCurrentSave), but not offering the button in the first place
     // is the simpler fix at the point a player would actually see it.
+    // Also true while our own quit-time save upload is still running
+    // (activeUploadThread) - without this, clicking "Open the World" in the
+    // brief window right after quitting (knownSaveVersion still equals
+    // localSaveVersion, since the upload hasn't landed yet, so
+    // openManagedWorld takes its instant no-download path with no lock at
+    // all) starts a brand-new IntegratedServer writing into the same world
+    // folder uploadSave()'s zipDirectory() is concurrently reading, which
+    // can promote a torn/corrupted zip as the group's official save -
+    // exactly what worldTransferLock exists to prevent between our OWN
+    // upload/download calls, but this button bypassed it entirely.
     boolean isPreparingWorld() {
-        return preparingWorld || migrationInProgress;
+        return preparingWorld || migrationInProgress || activeUploadThread != null;
     }
 
     // "No one is hosting and we're at the front of the queue" - the state in
@@ -1720,10 +1769,17 @@ public class CampfireClient implements ClientModInitializer {
 
     // ---------- Relay mode switching (Milestone 7a) ----------
 
-    private void updateHostingMode() {
+    private synchronized void updateHostingMode() {
         boolean hostNow = isHost();
 
         if (hostNow && relayHostMultiplexer == null) {
+            // Only bumped on an actual transition, not every call to this
+            // method (it's invoked redundantly whenever the coordinator
+            // re-sends 'state') - a bump on a no-op call would make an
+            // in-flight UPnP mapping attempt from THIS SAME hosting session
+            // wrongly think hosting had ended and self-unmap out from under
+            // itself. See attemptUpnpMapping.
+            hostingGeneration.incrementAndGet();
             if (relayFriendListener != null) {
                 relayFriendListener.stop();
                 relayFriendListener = null;
@@ -1736,6 +1792,7 @@ public class CampfireClient implements ClientModInitializer {
                 tryOpenToLan(server);
             }
         } else if (!hostNow && relayHostMultiplexer != null) {
+            hostingGeneration.incrementAndGet();
             relayHostMultiplexer.shutdownAll();
             relayHostMultiplexer = null;
             startFriendListenerIfNeeded();
@@ -1743,7 +1800,7 @@ public class CampfireClient implements ClientModInitializer {
         }
     }
 
-    private void startFriendListenerIfNeeded() {
+    private synchronized void startFriendListenerIfNeeded() {
         if (relayFriendListener == null) {
             relayFriendListener = new RelayFriendListener(RELAY_LISTEN_PORT, this::sendJson);
             relayFriendListener.start();
@@ -1924,8 +1981,22 @@ public class CampfireClient implements ClientModInitializer {
     // (rather than saying nothing) clears out any stale address a previous
     // host of this group might have left behind.
     private void attemptUpnpMapping() {
+        long myGeneration = hostingGeneration.get();
         new Thread(() -> {
             UpnpPortMapper.Result result = UpnpPortMapper.tryMapPort(HOST_LAN_PORT);
+            // Discovery alone measures ~9s (SSDP search + SOAP) - if hosting
+            // already ended (quit, migrated away) by the time this returns,
+            // updateHostingMode()'s own unmapPort() call ran too early and
+            // no-opped (tryMapPort hadn't published mappedGateway/mappedPort
+            // yet), and nothing else in this session will ever call
+            // unmapPort() again for this mapping. Left alone, that's a real
+            // stale router port-mapping entry every time a fast handoff
+            // races this - self-unmap immediately instead of publishing it.
+            if (result != null && hostingGeneration.get() != myGeneration) {
+                System.out.println("[Campfire] UPnP mapping finished after we stopped hosting - unmapping it immediately instead of publishing it.");
+                UpnpPortMapper.unmapPort();
+                return;
+            }
             JsonObject directAddress = new JsonObject();
             directAddress.addProperty("type", "direct_address");
             if (result != null) {
@@ -1993,9 +2064,21 @@ public class CampfireClient implements ClientModInitializer {
     // opening to LAN, so it may not have resolved yet by the time we get
     // here - in that case, wait briefly for host_direct_address rather than
     // assuming it'll never come.
+    // Two host_confirmed messages arriving close together (a fast migration
+    // chain), or a double-click of "Join X's World", can otherwise launch
+    // two concurrent connect flows - both trying to bind the same fixed
+    // hole-punch/bridge ports. The loser just hits a BindException and falls
+    // back to the relay (harmless), but it's a wasted ~8s hole-punch cycle
+    // right when fast repeated migrations are most likely. Each entry point
+    // below captures the generation current at ITS start and re-checks it
+    // before doing real work or committing to a connection, so a fresh call
+    // supersedes rather than races a stale one still in flight.
+    private final java.util.concurrent.atomic.AtomicLong connectGeneration = new java.util.concurrent.atomic.AtomicLong();
+
     private void connectToNewHost() {
+        long myGeneration = connectGeneration.incrementAndGet();
         if (hostDirectAddress != null) {
-            tryDirectConnectThenFallback(hostDirectAddress);
+            tryDirectConnectThenFallback(hostDirectAddress, myGeneration);
             return;
         }
 
@@ -2008,8 +2091,9 @@ public class CampfireClient implements ClientModInitializer {
                 return;
             }
             if (waitingForDirectAddress.compareAndSet(true, false)) {
+                if (myGeneration != connectGeneration.get()) return; // superseded by a fresher call
                 System.out.println("[Campfire] No direct (UPnP) address from host after waiting - trying a hole-punched connection instead.");
-                attemptHolePunch();
+                attemptHolePunch(myGeneration);
             }
         }, "campfire-direct-connect-wait").start();
     }
@@ -2019,7 +2103,7 @@ public class CampfireClient implements ClientModInitializer {
     // end-to-end (double NAT, a firewall blocking the port anyway, the
     // router lying). Falls back to the relay rather than leaving the
     // player staring at a failed connection with no explanation.
-    private void tryDirectConnectThenFallback(String address) {
+    private void tryDirectConnectThenFallback(String address, long myGeneration) {
         new Thread(() -> {
             String host;
             int port;
@@ -2041,6 +2125,10 @@ public class CampfireClient implements ClientModInitializer {
                 reachable = false;
             }
 
+            if (myGeneration != connectGeneration.get()) {
+                System.out.println("[Campfire] A fresher connection attempt superseded this one - dropping it.");
+                return;
+            }
             if (reachable) {
                 System.out.println("[Campfire] Host's direct address is reachable - connecting directly (no relay).");
                 connectionTier = ConnectionTier.DIRECT;
@@ -2073,9 +2161,10 @@ public class CampfireClient implements ClientModInitializer {
     // sent an outbound one (most home routers; never true behind
     // carrier-grade NAT) - any failure here just falls back to the relay,
     // same as a failed UPnP attempt does.
-    private void attemptHolePunch() {
+    private void attemptHolePunch(long myGeneration) {
         showMigrationToast("Optimizing connection...", "Trying to connect directly to your friend");
         new Thread(() -> {
+            if (myGeneration != connectGeneration.get()) return; // superseded before we even started
             HolePuncher.ReflectedAddress own = HolePuncher.reflect(coordinatorBareHost, coordinatorPort, PUNCH_LOCAL_PORT);
             if (own == null) {
                 System.out.println("[Campfire] Hole-punch unavailable (couldn't reflect our address via the coordinator or public STUN) - using the relay instead.");
@@ -2126,6 +2215,10 @@ public class CampfireClient implements ClientModInitializer {
                 return;
             }
 
+            if (myGeneration != connectGeneration.get()) {
+                System.out.println("[Campfire] A fresher connection attempt superseded this hole-punch - dropping it.");
+                return;
+            }
             java.net.Socket punched = HolePuncher.punch(peerIp, peerPort, PUNCH_LOCAL_PORT, HOLE_PUNCH_TIMEOUT_MS, HOLE_PUNCH_ATTEMPT_TIMEOUT_MS);
             if (punched == null) {
                 System.out.println("[Campfire] Hole-punch didn't connect (network likely blocks unsolicited inbound connections) - using the relay instead.");
@@ -2133,6 +2226,11 @@ public class CampfireClient implements ClientModInitializer {
                 return;
             }
 
+            if (myGeneration != connectGeneration.get()) {
+                System.out.println("[Campfire] A fresher connection attempt superseded this hole-punch after it connected - closing it.");
+                try { punched.close(); } catch (IOException ignored) { }
+                return;
+            }
             System.out.println("[Campfire] Hole-punched a direct connection to the host - no relay needed.");
             bridgePunchedSocketAndConnect(punched);
         }, "campfire-hole-punch").start();
@@ -2339,6 +2437,13 @@ public class CampfireClient implements ClientModInitializer {
     private static final long CHUNKED_UPLOAD_THRESHOLD_BYTES = 64L * 1024 * 1024;
     private static final int UPLOAD_PART_BYTES = 32 * 1024 * 1024;
 
+    // Sanity ceiling for a coordinator-reported download size, matching both
+    // coordinators' own 2GB upload backstop - no legitimate save gets close.
+    // Exists only to stop a malformed/hostile totalBytes from triggering an
+    // immediate huge allocation attempt (see downloadSaveViaWebSocket).
+    private static final int MAX_SAVE_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024;
+    private static final int MAX_SAVE_TRANSFER_PARTS = 8192;
+
     private boolean uploadSave(Path worldSaveDir) {
         byte[] zipBytes;
         try {
@@ -2380,7 +2485,7 @@ public class CampfireClient implements ClientModInitializer {
         for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
             try {
                 HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save"))
+                        .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save?playerId=" + playerId))
                         .header("Content-Type", "multipart/form-data; boundary=" + boundary)
                         // Generous - this carries the whole zipped world, which
                         // can legitimately take a while on a slow upload - but
@@ -2431,7 +2536,7 @@ public class CampfireClient implements ClientModInitializer {
     private Boolean uploadSaveChunked(byte[] zipBytes) {
         try {
             HttpResponse<String> begin = sendTransferWithRetries(HttpRequest.newBuilder()
-                    .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/begin"))
+                    .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/begin?playerId=" + playerId))
                     .timeout(Duration.ofSeconds(30))
                     .POST(HttpRequest.BodyPublishers.noBody())
                     .build());
@@ -2446,7 +2551,7 @@ public class CampfireClient implements ClientModInitializer {
                 System.out.println("[Campfire] Uploading save part " + (i + 1) + "/" + parts
                         + " (" + (part.length / 1024 / 1024) + " MB)");
                 HttpResponse<String> r = sendTransferWithRetries(HttpRequest.newBuilder()
-                        .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/part/" + i + "?uploadId=" + uploadId))
+                        .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/part/" + i + "?uploadId=" + uploadId + "&playerId=" + playerId))
                         .timeout(Duration.ofMinutes(5))
                         .PUT(HttpRequest.BodyPublishers.ofByteArray(part))
                         .build());
@@ -2460,7 +2565,7 @@ public class CampfireClient implements ClientModInitializer {
             commitBody.addProperty("uploadId", uploadId);
             commitBody.addProperty("parts", parts);
             HttpResponse<String> commit = sendTransferWithRetries(HttpRequest.newBuilder()
-                    .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/commit"))
+                    .uri(URI.create(coordinatorHost + "/groups/" + groupId + "/save/commit?playerId=" + playerId))
                     .header("Content-Type", "application/json")
                     .timeout(Duration.ofMinutes(1))
                     .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(commitBody)))
@@ -2599,6 +2704,20 @@ public class CampfireClient implements ClientModInitializer {
             if (begin == null) return null;
             int totalParts = begin.get("totalParts").getAsInt();
             int totalBytes = begin.get("totalBytes").getAsInt();
+            // The coordinator is only semi-trusted (self-hosted, or Workers/
+            // DO state that could be manipulated) - trusting totalBytes for
+            // an immediate pre-sized allocation let a malformed/hostile
+            // value near Integer.MAX_VALUE trigger an OutOfMemoryError,
+            // which (unlike an IOException) nothing downstream catches and
+            // can destabilize the whole game, not just fail this download.
+            // No legitimate save gets remotely close to the coordinators'
+            // own 2GB upload backstop.
+            if (totalBytes < 0 || totalBytes > MAX_SAVE_TRANSFER_BYTES
+                    || totalParts < 0 || totalParts > MAX_SAVE_TRANSFER_PARTS) {
+                System.out.println("[Campfire] Coordinator sent an implausible download size (bytes="
+                        + totalBytes + ", parts=" + totalParts + ") - refusing it.");
+                return null;
+            }
 
             ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(totalBytes, 0));
             for (int i = 0; i < totalParts; i++) {
@@ -3021,8 +3140,16 @@ public class CampfireClient implements ClientModInitializer {
 
     // ---------- level.dat / playerdata swap (Milestone 6) ----------
 
-    private void swapPlayerData(Path worldDir, String outgoingHostId, String incomingHostId) {
-        try {
+    // Throws IOException on any write failure (disk full, an AV/file-lock
+    // hiccup, permission error - all realistic on flaky consumer hardware)
+    // rather than swallowing it. This runs during downloadCurrentSave's
+    // "Stage 1: unpack + player-data swap into a scratch dir - any
+    // corruption throws HERE, with the live world untouched" step; silently
+    // continuing past a failed write here used to leave a truncated/corrupt
+    // level.dat in the scratch dir that the caller had no way to detect,
+    // and it would still get promoted over the good backup by the atomic
+    // move-into-place that follows.
+    private void swapPlayerData(Path worldDir, String outgoingHostId, String incomingHostId) throws IOException {
             File levelDatFile = worldDir.resolve("level.dat").toFile();
             if (!levelDatFile.exists()) {
                 System.out.println("[Campfire] No level.dat found yet, skipping player-data swap.");
@@ -3071,10 +3198,6 @@ public class CampfireClient implements ClientModInitializer {
             root.put("Data", data);
             NbtIo.writeCompressed(root, levelDatFile);
             System.out.println("[Campfire] Player-data swap complete.");
-        } catch (IOException e) {
-            System.out.println("[Campfire] Player-data swap failed: " + e.getMessage());
-            e.printStackTrace();
-        }
     }
 
     // Minecraft 1.20 stores an entity's UUID as an int-array tag of 4 ints
@@ -3093,6 +3216,16 @@ public class CampfireClient implements ClientModInitializer {
 
     private class CoordinatorListener implements WebSocket.Listener {
         private final StringBuilder buffer = new StringBuilder();
+        // The coordinator is only semi-trusted (self-hosted, or Workers/DO
+        // state that could be manipulated), and this buffer previously had
+        // no size cap at all - a single hostile multi-part text message
+        // (most naturally a relay_data frame with an oversized "data"
+        // field) would accumulate without limit, and every connected
+        // client processes every relay_data it receives, so one crafted
+        // message could OOM-crash a whole group at once. Comfortably above
+        // the largest legitimate message (a base64'd save-transfer chunk,
+        // at most a couple MB) with headroom for JSON overhead.
+        private static final int MAX_INBOUND_MESSAGE_CHARS = 16 * 1024 * 1024;
 
         @Override
         public void onOpen(WebSocket ws) {
@@ -3136,6 +3269,13 @@ public class CampfireClient implements ClientModInitializer {
         @Override
         public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
             lastCoordinatorInboundMs = System.currentTimeMillis();
+            if (buffer.length() + data.length() > MAX_INBOUND_MESSAGE_CHARS) {
+                System.out.println("[Campfire] Coordinator sent an oversized message (over "
+                        + (MAX_INBOUND_MESSAGE_CHARS / 1024 / 1024) + "MB) - dropping it.");
+                buffer.setLength(0);
+                ws.request(1);
+                return null;
+            }
             buffer.append(data);
             if (last) {
                 String message = buffer.toString();
@@ -3212,7 +3352,7 @@ public class CampfireClient implements ClientModInitializer {
                             ? json.get("address").getAsString() : null;
                     System.out.println("[Campfire] Host direct address: " + (hostDirectAddress != null ? hostDirectAddress : "(none - UPnP unavailable)"));
                     if (hostDirectAddress != null && !isHost() && waitingForDirectAddress.compareAndSet(true, false)) {
-                        tryDirectConnectThenFallback(hostDirectAddress);
+                        tryDirectConnectThenFallback(hostDirectAddress, connectGeneration.get());
                     }
                 }
                 case "owner_settings_change" -> {

@@ -390,9 +390,6 @@ public class CampfireStatusScreen extends Screen {
 
                 String name = m.name() + (m.you() ? " (you)" : "");
                 int textX = x + 4 + avatarSize + 6;
-                context.drawTextWithShadow(textRenderer, Text.literal(name), textX,
-                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2,
-                        m.you() ? CampfireUi.ACCENT_BRIGHT : CampfireUi.TEXT_COLOR);
 
                 // A mod-list mismatch takes priority over the usual
                 // host/next-up tag - hosting can rotate to ANY player here,
@@ -413,6 +410,17 @@ public class CampfireStatusScreen extends Screen {
                     tag = null;
                     tagColor = CampfireUi.MUTED_TEXT;
                 }
+                // Names come straight off the coordinator's `state` broadcast
+                // with no length cap there - an oversized/crafted name (a
+                // self-hosted coordinator, or a modified client) could
+                // otherwise overlap the tag drawn at a fixed offset from the
+                // row's right edge, since that position was computed
+                // independently of the name's actual drawn width.
+                int tagReserve = tag != null ? textRenderer.getWidth(tag) + 8 : 4;
+                int textMaxWidth = width - (textX - x) - tagReserve;
+                context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(name, textMaxWidth)), textX,
+                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2,
+                        m.you() ? CampfireUi.ACCENT_BRIGHT : CampfireUi.TEXT_COLOR);
                 if (tag != null) {
                     context.drawTextWithShadow(textRenderer, Text.literal(tag),
                             x + width - 4 - textRenderer.getWidth(tag),
@@ -435,9 +443,10 @@ public class CampfireStatusScreen extends Screen {
                 int avatarY = y + (ROSTER_ROW_HEIGHT - avatarSize) / 2;
                 CampfireUi.drawAvatar(context, textRenderer, a.name(), x + 4, avatarY, avatarSize, false, false);
                 int textX = x + 4 + avatarSize + 6;
-                context.drawTextWithShadow(textRenderer, Text.literal(a.name()), textX,
-                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);
                 String tag = describeLastSeen(a.lastSeenMs());
+                int textMaxWidth = width - (textX - x) - (textRenderer.getWidth(tag) + 8);
+                context.drawTextWithShadow(textRenderer, Text.literal(textRenderer.trimToWidth(a.name(), textMaxWidth)), textX,
+                        y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);
                 context.drawTextWithShadow(textRenderer, Text.literal(tag),
                         x + width - 4 - textRenderer.getWidth(tag),
                         y + (ROSTER_ROW_HEIGHT - textRenderer.fontHeight) / 2, CampfireUi.MUTED_TEXT);

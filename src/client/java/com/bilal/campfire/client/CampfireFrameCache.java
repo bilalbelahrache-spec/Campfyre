@@ -44,11 +44,24 @@ public final class CampfireFrameCache {
     }
 
     private static void tick(MinecraftClient client) {
+        // Checked BEFORE the active-countdown branch below: a disconnect,
+        // quit-to-title, or host migration into an unrelated world/dimension
+        // mid-effect used to leave ticksRemaining counting down regardless -
+        // this is a static, session-agnostic field, so an active roll would
+        // carry straight into whatever the player reconnects to next and
+        // force every newly-rendered mob THERE to stare too, for however
+        // many ticks were left. Self-healing within 10s either way, but
+        // there's no reason to let it leak across a session boundary at all.
+        if (client.world == null || client.player == null) {
+            tickCounter = 0;
+            ticksRemaining = 0;
+            return;
+        }
         if (ticksRemaining > 0) {
             ticksRemaining--;
             return;
         }
-        if (client.world == null || client.player == null || client.currentScreen != null) {
+        if (client.currentScreen != null) {
             tickCounter = 0;
             return;
         }

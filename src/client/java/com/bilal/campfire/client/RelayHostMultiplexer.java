@@ -66,17 +66,24 @@ public class RelayHostMultiplexer {
      * now runs on its own spawned thread instead.
      */
     public void openStream(String streamId, String fromPlayerId) {
+        // Checked here, before spawning anything - a misbehaving/compromised
+        // coordinator flooding far more than MAX_CONCURRENT_STREAMS worth of
+        // relay_open would otherwise still cause unbounded thread creation
+        // (the old check only ran inside the spawned thread's body), since
+        // each one lives just long enough to hit the cap and exit. That's a
+        // real, if transient, resource-exhaustion vector on the host's own
+        // machine.
+        if (streams.size() >= MAX_CONCURRENT_STREAMS) {
+            System.out.println("[Campfire] Refusing relay stream " + streamId + " - already at the " + MAX_CONCURRENT_STREAMS + "-stream cap.");
+            sendClose(streamId, fromPlayerId);
+            return;
+        }
         Thread openThread = new Thread(() -> openStreamBlocking(streamId, fromPlayerId), "relay-host-open-" + streamId);
         openThread.setDaemon(true);
         openThread.start();
     }
 
     private void openStreamBlocking(String streamId, String fromPlayerId) {
-        if (streams.size() >= MAX_CONCURRENT_STREAMS) {
-            System.out.println("[Campfire] Refusing relay stream " + streamId + " - already at the " + MAX_CONCURRENT_STREAMS + "-stream cap.");
-            sendClose(streamId, fromPlayerId);
-            return;
-        }
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress("127.0.0.1", lanPort), 5000);
