@@ -2,6 +2,9 @@ package com.bilal.campfyre.client.mixin;
 
 import com.bilal.campfyre.client.CampfyreZoom;
 import net.minecraft.client.Keyboard;
+//? if >=1.21.9 {
+/*import net.minecraft.client.input.KeyInput;
+*///?}
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -24,8 +27,22 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Keyboard.class)
 abstract class KeyboardMixin {
 
+    //? if <1.21.9 {
     @Inject(method = "onKey", at = @At("HEAD"))
     private void campfyre$trackZoomKeyRaw(long window, int key, int scancode, int action, int modifiers, CallbackInfo ci) {
-        CampfyreZoom.onRawKeyEvent(key, scancode, action);
+        CampfyreZoom.onRawKeyEvent(key, scancode, action, modifiers);
     }
+    //?}
+    //? if >=1.21.9 {
+    /*// onKey's own signature collapsed key/scancode/modifiers into one
+    // KeyInput record at 1.21.9, same rework as KeyBinding.matchesKey -
+    // verified via javap against the mapped jar (Mixin's own remap step
+    // caught the stale descriptor here as a real "Invalid descriptor" apply
+    // failure, not a compile error, since @Inject targets are matched by
+    // method descriptor at Mixin-apply time).
+    @Inject(method = "onKey", at = @At("HEAD"))
+    private void campfyre$trackZoomKeyRaw(long window, int action, KeyInput input, CallbackInfo ci) {
+        CampfyreZoom.onRawKeyEvent(input.key(), input.scancode(), action, input.modifiers());
+    }
+    *///?}
 }

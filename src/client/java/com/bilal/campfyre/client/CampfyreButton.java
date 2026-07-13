@@ -3,7 +3,14 @@ package com.bilal.campfyre.client;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
+//? if <1.21.11 {
 import net.minecraft.client.gui.widget.ButtonWidget;
+//?}
+//? if >=1.21.11 {
+/*import net.minecraft.client.gui.widget.ClickableWidget;
+import net.minecraft.client.gui.screen.narration.NarrationMessageBuilder;
+import net.minecraft.client.gui.screen.narration.NarrationPart;
+*///?}
 import net.minecraft.text.Text;
 
 // Flat, dark card-style button used on the cozy Campfyre screens in place of
@@ -12,6 +19,20 @@ import net.minecraft.text.Text;
 // only renderButton() is replaced. Public (and constructors public) because
 // TitleScreenMixin, in a different package, constructs one directly for the
 // docked title-screen button.
+//
+// 1.21.11 made ButtonWidget abstract and sealed renderWidget() as final
+// (rendering now goes through drawIcon()/drawLabel() instead) - verified via
+// javap. That's incompatible with a fully custom-painted button like this
+// one, so from 1.21.11 on this extends ClickableWidget directly instead
+// (same base CampfyreScrollPane already uses) and reimplements the small
+// slice of ButtonWidget behavior actually needed: press-on-click, press-on-
+// Enter/Space, and narration. Also: ButtonWidget gained its OWN nested
+// `Text` class at 1.21.11, which silently shadows the imported
+// net.minecraft.text.Text for any unqualified `Text` reference in a
+// subclass - real compile breakage this file hit directly, not just a
+// style choice; net.minecraft.text.Text is used unqualified only above
+// this class ever needed to extend ButtonWidget.
+//? if <1.21.11 {
 public class CampfyreButton extends ButtonWidget {
 
     private enum Style { TEXT, ICON_TEXT, ICON_ONLY }
@@ -70,8 +91,20 @@ public class CampfyreButton extends ButtonWidget {
         this.style = style;
     }
 
+    //? if <1.20.3 {
     @Override
     protected void renderButton(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderCampfyreButton(context, mouseX, mouseY, delta);
+    }
+    //?}
+    //? if >=1.20.3 {
+    /*@Override
+    protected void renderWidget(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderCampfyreButton(context, mouseX, mouseY, delta);
+    }
+    *///?}
+
+    private void renderCampfyreButton(DrawContext context, int mouseX, int mouseY, float delta) {
         int x = getX();
         int y = getY();
         int w = getWidth();
@@ -81,7 +114,12 @@ public class CampfyreButton extends ButtonWidget {
         context.fill(x, y, x + w, y + h, active ? CampfyreUi.BUTTON_BG : CampfyreUi.BUTTON_BG_DISABLED);
         context.fillGradient(x, y, x + w, y + h / 2,
                 CampfyreUi.withAlpha(0xFFFFFF, hovered ? 28 : 14), 0x00FFFFFF);
+        //? if <1.21.9 {
         context.drawBorder(x, y, w, h, hovered ? CampfyreUi.ACCENT : CampfyreUi.BUTTON_BORDER);
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(x, y, w, h, hovered ? CampfyreUi.ACCENT : CampfyreUi.BUTTON_BORDER);
+        *///?}
 
         switch (style) {
             case ICON_ONLY -> {
@@ -125,3 +163,130 @@ public class CampfyreButton extends ButtonWidget {
         }
     }
 }
+//?}
+//? if >=1.21.11 {
+/*public class CampfyreButton extends ClickableWidget {
+
+    public interface PressAction {
+        void onPress(CampfyreButton button);
+    }
+
+    private enum Style { TEXT, ICON_TEXT, ICON_ONLY }
+
+    private final Style style;
+    private final PressAction onPress;
+
+    private java.util.function.IntSupplier statusDotColor;
+
+    public void setStatusDot(java.util.function.IntSupplier colorSupplier) {
+        this.statusDotColor = colorSupplier;
+    }
+
+    private boolean showCheckmark = false;
+
+    public void setShowCheckmark(boolean showCheckmark) {
+        this.showCheckmark = showCheckmark;
+    }
+
+    public CampfyreButton(int x, int y, int width, int height, Text message, PressAction onPress) {
+        this(x, y, width, height, message, onPress, Style.TEXT);
+    }
+
+    public CampfyreButton(int x, int y, int width, int height, Text message, PressAction onPress, boolean withIcon) {
+        this(x, y, width, height, message, onPress, withIcon ? Style.ICON_TEXT : Style.TEXT);
+    }
+
+    public static CampfyreButton iconOnly(int x, int y, int size, Text narrationMessage, PressAction onPress) {
+        return iconOnly(x, y, size, size, narrationMessage, onPress);
+    }
+
+    public static CampfyreButton iconOnly(int x, int y, int width, int height, Text narrationMessage, PressAction onPress) {
+        return new CampfyreButton(x, y, width, height, narrationMessage, onPress, Style.ICON_ONLY);
+    }
+
+    private CampfyreButton(int x, int y, int width, int height, Text message, PressAction onPress, Style style) {
+        super(x, y, width, height, message);
+        this.onPress = onPress;
+        this.style = style;
+    }
+
+    @Override
+    public void onClick(net.minecraft.client.gui.Click click, boolean doubled) {
+        onPress.onPress(this);
+    }
+
+    @Override
+    public boolean keyPressed(net.minecraft.client.input.KeyInput input) {
+        if (isInteractable() && input.isEnterOrSpace()) {
+            playDownSound(MinecraftClient.getInstance().getSoundManager());
+            onPress.onPress(this);
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    protected void appendClickableNarrations(NarrationMessageBuilder builder) {
+        builder.put(NarrationPart.TITLE, getNarrationMessage());
+    }
+
+    @Override
+    protected void renderWidget(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderCampfyreButton(context, mouseX, mouseY, delta);
+    }
+
+    private void renderCampfyreButton(DrawContext context, int mouseX, int mouseY, float delta) {
+        int x = getX();
+        int y = getY();
+        int w = getWidth();
+        int h = getHeight();
+        boolean hovered = isHovered() && active;
+
+        context.fill(x, y, x + w, y + h, active ? CampfyreUi.BUTTON_BG : CampfyreUi.BUTTON_BG_DISABLED);
+        context.fillGradient(x, y, x + w, y + h / 2,
+                CampfyreUi.withAlpha(0xFFFFFF, hovered ? 28 : 14), 0x00FFFFFF);
+        context.drawStrokedRectangle(x, y, w, h, hovered ? CampfyreUi.ACCENT : CampfyreUi.BUTTON_BORDER);
+
+        switch (style) {
+            case ICON_ONLY -> {
+                if (hovered) {
+                    context.fill(x + 1, y + h - 2, x + w - 1, y + h - 1, CampfyreUi.ACCENT);
+                }
+                CampfyreUi.drawCampfyreIcon(context, x + (w - CampfyreUi.ICON_WIDTH) / 2, y + (h - CampfyreUi.ICON_HEIGHT) / 2);
+                if (statusDotColor != null) {
+                    int dot = statusDotColor.getAsInt();
+                    if (dot != 0) {
+                        CampfyreUi.drawStatusDot(context, x + w - 4, y + 3, dot, dot == CampfyreUi.DOT_CONNECTING);
+                    }
+                }
+            }
+            case ICON_TEXT -> {
+                if (hovered) {
+                    context.fill(x + 1, y + 1, x + 3, y + h - 1, CampfyreUi.ACCENT);
+                }
+                TextRenderer tr = MinecraftClient.getInstance().textRenderer;
+                int textColor = !active ? CampfyreUi.DISABLED_TEXT : hovered ? CampfyreUi.TITLE_COLOR : CampfyreUi.TEXT_COLOR;
+                int textWidth = tr.getWidth(getMessage());
+                int gap = 5;
+                int totalWidth = CampfyreUi.ICON_WIDTH + gap + textWidth;
+                int startX = x + (w - totalWidth) / 2;
+                if (showCheckmark) {
+                    CampfyreUi.drawCheckmark(context, startX, y + (h - CampfyreUi.ICON_HEIGHT) / 2, CampfyreUi.SUCCESS_COLOR);
+                } else {
+                    CampfyreUi.drawCampfyreIcon(context, startX, y + (h - CampfyreUi.ICON_HEIGHT) / 2);
+                }
+                context.drawTextWithShadow(tr, getMessage(), startX + CampfyreUi.ICON_WIDTH + gap,
+                        y + (h - tr.fontHeight) / 2, textColor);
+            }
+            case TEXT -> {
+                if (hovered) {
+                    context.fill(x + 1, y + 1, x + 3, y + h - 1, CampfyreUi.ACCENT);
+                }
+                TextRenderer tr = MinecraftClient.getInstance().textRenderer;
+                int textColor = !active ? CampfyreUi.DISABLED_TEXT : hovered ? CampfyreUi.TITLE_COLOR : CampfyreUi.TEXT_COLOR;
+                context.drawCenteredTextWithShadow(tr, getMessage(), x + w / 2, y + (h - tr.fontHeight) / 2, textColor);
+            }
+        }
+    }
+}
+*///?}

@@ -5,6 +5,9 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.render.VertexConsumerProvider;
 import net.minecraft.client.render.entity.LivingEntityRenderer;
+//? if >=1.21.2 {
+/*import net.minecraft.client.render.entity.state.LivingEntityRenderState;
+*///?}
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.command.argument.EntityAnchorArgumentType;
 import net.minecraft.entity.LivingEntity;
@@ -36,6 +39,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(LivingEntityRenderer.class)
 abstract class LivingEntityRendererMixin {
 
+    //? if <1.21.2 {
     @Inject(method = "render(Lnet/minecraft/entity/LivingEntity;FFLnet/minecraft/client/util/math/MatrixStack;Lnet/minecraft/client/render/VertexConsumerProvider;I)V", at = @At("HEAD"))
     private void campfyre$adjustEntityRotation(LivingEntity entity, float yaw, float tickDelta, MatrixStack matrices, VertexConsumerProvider vertexConsumers, int light, CallbackInfo ci) {
         if (!CampfyreFrameCache.isActive()) return;
@@ -46,4 +50,24 @@ abstract class LivingEntityRendererMixin {
 
         entity.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, viewer.getEyePos());
     }
+    //?}
+    //? if >=1.21.2 {
+    /*
+    // render() no longer takes the live LivingEntity at all from 1.21.2 on -
+    // it only reads a captured LivingEntityRenderState snapshot. updateRenderState
+    // is what COPIES the entity's current rotation fields into that snapshot
+    // each frame, so mutating the entity here at its HEAD (before that copy
+    // happens) reaches render() exactly the same way the old HEAD-of-render
+    // injection did - verified via javap against the mapped 1.21.2 jar.
+    @Inject(method = "updateRenderState(Lnet/minecraft/entity/LivingEntity;Lnet/minecraft/client/render/entity/state/LivingEntityRenderState;F)V", at = @At("HEAD"))
+    private void campfyre$adjustEntityRotation(LivingEntity entity, LivingEntityRenderState state, float tickDelta, CallbackInfo ci) {
+        if (!CampfyreFrameCache.isActive()) return;
+        if (!(entity instanceof MobEntity)) return;
+
+        AbstractClientPlayerEntity viewer = MinecraftClient.getInstance().player;
+        if (viewer == null || entity == viewer.getVehicle()) return;
+
+        entity.lookAt(EntityAnchorArgumentType.EntityAnchor.EYES, viewer.getEyePos());
+    }
+    *///?}
 }

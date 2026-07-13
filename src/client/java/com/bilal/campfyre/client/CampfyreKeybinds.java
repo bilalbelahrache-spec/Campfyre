@@ -4,6 +4,9 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
+//? if >=1.21.9 {
+/*import net.minecraft.util.Identifier;
+*///?}
 import org.lwjgl.glfw.GLFW;
 
 // The docked title-screen button is great until you're actually IN the world
@@ -16,12 +19,27 @@ import org.lwjgl.glfw.GLFW;
 // chat or another GUI.
 final class CampfyreKeybinds {
 
+    // KeyBinding.Category.create(Identifier) throws if the same identifier is
+    // registered twice - CampfyreZoom binds a key under the same "Campfyre"
+    // category, so both keybinding registrations share this ONE instance
+    // rather than each calling .create() with the same id (hit as a real
+    // startup crash: "Category 'campfyre:main' is already registered").
+    //? if >=1.21.9 {
+    /*static final KeyBinding.Category CATEGORY = KeyBinding.Category.create(Identifier.of("campfyre", "main"));
+    *///?}
+
     private CampfyreKeybinds() {
     }
 
     static void register(CampfyreClient mod) {
+        //? if <1.21.9 {
         KeyBinding openScreen = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.campfyre.open", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_B, "category.campfyre"));
+        //?}
+        //? if >=1.21.9 {
+        /*KeyBinding openScreen = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.campfyre.open", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_B, CATEGORY));
+        *///?}
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openScreen.wasPressed()) {

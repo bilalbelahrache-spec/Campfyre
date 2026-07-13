@@ -16,6 +16,14 @@ import net.minecraft.client.toast.ToastManager;
 // startTime is milliseconds since this toast appeared; return HIDE to
 // dismiss. Width/height default to 160x32 via the interface; we widen
 // slightly so two-line descriptions don't have to be brutally truncated.
+//
+// 1.21.2 split that single method into three: getVisibility() (a plain
+// getter, no time param), update(ToastManager, long) (called every frame to
+// recompute state), and draw(DrawContext, TextRenderer, long) (pure
+// rendering, void, TextRenderer handed directly instead of via ToastManager)
+// - verified via javap against the mapped 1.21.2 jar. visibility now has to
+// be tracked as a field since getVisibility() has nothing else to compute it
+// from.
 class CampfyreToast implements Toast {
 
     private static final long DISPLAY_MS = 6000;
@@ -27,6 +35,10 @@ class CampfyreToast implements Toast {
     // the Text/StringVisitable path needs an extra OrderedText conversion.
     private final String title;
     private final String description;
+
+    //? if >=1.21.2 {
+    /*private Visibility visibility = Visibility.SHOW;
+    *///?}
 
     CampfyreToast(String title, String description) {
         this.title = title;
@@ -43,25 +55,50 @@ class CampfyreToast implements Toast {
         return HEIGHT;
     }
 
+    //? if <1.21.2 {
     @Override
     public Visibility draw(DrawContext context, ToastManager manager, long startTime) {
+        drawCampfyreToast(context, manager.getClient().textRenderer);
+        return startTime >= DISPLAY_MS ? Visibility.HIDE : Visibility.SHOW;
+    }
+    //?}
+    //? if >=1.21.2 {
+    /*@Override
+    public Visibility getVisibility() {
+        return visibility;
+    }
+
+    @Override
+    public void update(ToastManager manager, long time) {
+        visibility = time >= DISPLAY_MS ? Visibility.HIDE : Visibility.SHOW;
+    }
+
+    @Override
+    public void draw(DrawContext context, TextRenderer tr, long time) {
+        drawCampfyreToast(context, tr);
+    }
+    *///?}
+
+    private void drawCampfyreToast(DrawContext context, TextRenderer tr) {
         // Card: gradient dark panel (same top-lit look as every screen's
         // panel now) with the two-tone border and a breathing accent strip
         // down the left edge, echoing CampfyreButton's hover accent.
         context.fillGradient(0, 0, WIDTH, HEIGHT, CampfyreUi.PANEL_BG_TOP, CampfyreUi.PANEL_BG);
+        //? if <1.21.9 {
         context.drawBorder(0, 0, WIDTH, HEIGHT, CampfyreUi.PANEL_BORDER_INNER);
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(0, 0, WIDTH, HEIGHT, CampfyreUi.PANEL_BORDER_INNER);
+        *///?}
         int stripAlpha = 200 + (int) (55 * CampfyreUi.breathe(2600));
         context.fill(1, 1, 3, HEIGHT - 1, CampfyreUi.withAlpha(CampfyreUi.ACCENT & 0xFFFFFF, Math.min(255, stripAlpha)));
         context.fillGradient(1, 1, WIDTH - 1, HEIGHT / 2, CampfyreUi.withAlpha(0xFFFFFF, 14), 0x00FFFFFF);
 
         CampfyreUi.drawCampfyreIcon(context, 7, (HEIGHT - CampfyreUi.ICON_HEIGHT) / 2);
 
-        TextRenderer tr = manager.getClient().textRenderer;
         int textX = 7 + CampfyreUi.ICON_WIDTH + 6;
         int maxTextWidth = WIDTH - textX - 6;
         context.drawTextWithShadow(tr, tr.trimToWidth(title, maxTextWidth), textX, 6, CampfyreUi.TITLE_COLOR);
         context.drawTextWithShadow(tr, tr.trimToWidth(description, maxTextWidth), textX, 18, CampfyreUi.TEXT_COLOR);
-
-        return startTime >= DISPLAY_MS ? Visibility.HIDE : Visibility.SHOW;
     }
 }

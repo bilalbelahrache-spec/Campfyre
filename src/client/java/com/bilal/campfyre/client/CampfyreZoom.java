@@ -5,6 +5,9 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
+//? if >=1.21.9 {
+/*import net.minecraft.client.input.KeyInput;
+*///?}
 import net.minecraft.util.math.MathHelper;
 import org.lwjgl.glfw.GLFW;
 
@@ -79,8 +82,14 @@ public final class CampfyreZoom {
     }
 
     public static void register(CampfyreClient mod) {
+        //? if <1.21.9 {
         zoomKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.campfyre.zoom", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_C, "category.campfyre"));
+        //?}
+        //? if >=1.21.9 {
+        /*zoomKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.campfyre.zoom", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_C, CampfyreKeybinds.CATEGORY));
+        *///?}
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> tick());
     }
@@ -94,8 +103,14 @@ public final class CampfyreZoom {
     // priority: another keybinding (vanilla's or another mod's) bound to the
     // same physical key can't starve zoom of its own press/release events,
     // because zoom never waits on that shared path in the first place.
-    public static void onRawKeyEvent(int keyCode, int scanCode, int action) {
-        if (zoomKey == null || !zoomKey.matchesKey(keyCode, scanCode)) return;
+    public static void onRawKeyEvent(int keyCode, int scanCode, int action, int modifiers) {
+        if (zoomKey == null) return;
+        //? if <1.21.9 {
+        if (!zoomKey.matchesKey(keyCode, scanCode)) return;
+        //?}
+        //? if >=1.21.9 {
+        /*if (!zoomKey.matchesKey(new KeyInput(keyCode, scanCode, modifiers))) return;
+        *///?}
         if (action == GLFW.GLFW_PRESS) rawHeld = true;
         else if (action == GLFW.GLFW_RELEASE) rawHeld = false;
         // GLFW_REPEAT: key is still down, no state change - ignored.

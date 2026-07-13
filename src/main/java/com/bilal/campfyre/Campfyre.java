@@ -25,6 +25,11 @@ public class Campfyre implements ModInitializer {
 	}
 
 	public static Identifier id(String path) {
+		//? if <1.21 {
 		return new Identifier(MOD_ID, path);
+		//?}
+		//? if >=1.21 {
+		/*return Identifier.of(MOD_ID, path);
+		*///?}
 	}
 }

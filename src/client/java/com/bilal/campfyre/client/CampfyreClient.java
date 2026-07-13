@@ -7,15 +7,21 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gui.screen.ConnectScreen;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.network.ServerAddress;
 import net.minecraft.client.network.ServerInfo;
+//? if <1.20.2 {
 import net.minecraft.client.util.Session;
+//?}
+//? if >=1.20.2 {
+/*import net.minecraft.client.session.Session;
+*///?}
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.registry.RegistryKeys;
+//? if >=1.21.2 {
+/*import net.minecraft.resource.featuretoggle.FeatureFlags;
+*///?}
 import net.minecraft.resource.DataConfiguration;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.integrated.IntegratedServer;
@@ -24,7 +30,13 @@ import net.minecraft.text.Text;
 import net.minecraft.util.WorldSavePath;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.GameMode;
+//? if <1.21.11 {
 import net.minecraft.world.GameRules;
+//?}
+//? if >=1.21.11 {
+/*import net.minecraft.world.rule.GameRule;
+import net.minecraft.world.rule.GameRules;
+*///?}
 import net.minecraft.world.gen.GeneratorOptions;
 import net.minecraft.world.gen.WorldPresets;
 import net.minecraft.world.level.LevelInfo;
@@ -258,9 +270,27 @@ public class CampfyreClient implements ClientModInitializer {
     // (randomTickSpeed, playersSleepingPercentage, ...) are deliberately left
     // out - a numeric rule would need a different widget entirely, and the
     // rest aren't things a casual survival group typically wants to touch.
+    //? if <1.21.11 {
     record CuratedGameRule(String label, GameRules.Key<GameRules.BooleanRule> key) {
     }
+    //?}
+    //? if >=1.21.11 {
+    /*record CuratedGameRule(String label, GameRule<Boolean> key) {
+    }
+    *///?}
 
+    // 1.21.11 moved GameRules to net.minecraft.world.rule, made every rule a
+    // generic GameRule<T> (verified via javap), and renamed several of the
+    // ones curated here: NATURAL_REGENERATION -> NATURAL_HEALTH_REGENERATION,
+    // DO_DAYLIGHT_CYCLE -> ADVANCE_TIME, DO_WEATHER_CYCLE -> ADVANCE_WEATHER,
+    // DO_INSOMNIA -> SPAWN_PHANTOMS (closest surviving equivalent - the old
+    // rule specifically gated phantoms behind "insomnia", the new one is a
+    // plain spawn toggle). DO_FIRE_TICK has no boolean equivalent at all
+    // anymore - its closest surviving relative, FIRE_SPREAD_RADIUS_AROUND_
+    // PLAYER, is an integer radius, not an on/off switch, so "Fire Spread"
+    // is dropped from the curated list here rather than mapped to something
+    // that would silently misrepresent what the toggle does.
+    //? if <1.21.11 {
     static final java.util.List<CuratedGameRule> CURATED_GAME_RULES = java.util.List.of(
             new CuratedGameRule("Keep Inventory", GameRules.KEEP_INVENTORY),
             new CuratedGameRule("Mob Griefing", GameRules.DO_MOB_GRIEFING),
@@ -279,6 +309,26 @@ public class CampfyreClient implements ClientModInitializer {
             new CuratedGameRule("Insomnia (Phantoms)", GameRules.DO_INSOMNIA),
             new CuratedGameRule("Disable Raids", GameRules.DISABLE_RAIDS)
     );
+    //?}
+    //? if >=1.21.11 {
+    /*static final java.util.List<CuratedGameRule> CURATED_GAME_RULES = java.util.List.of(
+            new CuratedGameRule("Keep Inventory", GameRules.KEEP_INVENTORY),
+            new CuratedGameRule("Mob Griefing", GameRules.DO_MOB_GRIEFING),
+            new CuratedGameRule("Mob Spawning", GameRules.DO_MOB_SPAWNING),
+            new CuratedGameRule("Natural Regeneration", GameRules.NATURAL_HEALTH_REGENERATION),
+            new CuratedGameRule("Daylight Cycle", GameRules.ADVANCE_TIME),
+            new CuratedGameRule("Weather Cycle", GameRules.ADVANCE_WEATHER),
+            new CuratedGameRule("Fall Damage", GameRules.FALL_DAMAGE),
+            new CuratedGameRule("Fire Damage", GameRules.FIRE_DAMAGE),
+            new CuratedGameRule("Drowning Damage", GameRules.DROWNING_DAMAGE),
+            new CuratedGameRule("Freeze Damage", GameRules.FREEZE_DAMAGE),
+            new CuratedGameRule("Show Death Messages", GameRules.SHOW_DEATH_MESSAGES),
+            new CuratedGameRule("Announce Advancements", GameRules.ANNOUNCE_ADVANCEMENTS),
+            new CuratedGameRule("Immediate Respawn", GameRules.DO_IMMEDIATE_RESPAWN),
+            new CuratedGameRule("Insomnia (Phantoms)", GameRules.SPAWN_PHANTOMS),
+            new CuratedGameRule("Disable Raids", GameRules.DISABLE_RAIDS)
+    );
+    *///?}
 
     // ---------- Live status the GUI renders (status screen, HUD, docked button dot) ----------
 
@@ -1518,9 +1568,16 @@ public class CampfyreClient implements ClientModInitializer {
     // roster updates arrive on the WebSocket thread.
     private void playCrackle() {
         MinecraftClient client = MinecraftClient.getInstance();
+        //? if <1.21.11 {
         client.execute(() -> client.getSoundManager().play(
                 net.minecraft.client.sound.PositionedSoundInstance.master(
                         net.minecraft.sound.SoundEvents.BLOCK_CAMPFIRE_CRACKLE, 1.0f, 0.5f)));
+        //?}
+        //? if >=1.21.11 {
+        /*client.execute(() -> client.getSoundManager().play(
+                net.minecraft.client.sound.PositionedSoundInstance.ui(
+                        net.minecraft.sound.SoundEvents.BLOCK_CAMPFIRE_CRACKLE, 1.0f, 0.5f)));
+        *///?}
     }
 
     public CoordinatorStatus getStatus() {
@@ -1642,7 +1699,7 @@ public class CampfyreClient implements ClientModInitializer {
     // anything failed. Catch, log loudly, and say so on screen.
     private void startWorldGuarded(MinecraftClient client, Screen parent) {
         try {
-            client.createIntegratedServerLoader().start(parent, groupId);
+            CampfyreWorldCreator.start(client, parent, groupId);
         } catch (Exception e) {
             System.out.println("[Campfyre] Opening the world failed: " + e);
             e.printStackTrace();
@@ -1671,12 +1728,25 @@ public class CampfyreClient implements ClientModInitializer {
         activeWorldName = levelName;
         persistConfig();
         MinecraftClient client = MinecraftClient.getInstance();
+        //? if <1.21.2 {
         LevelInfo levelInfo = new LevelInfo(levelName, GameMode.SURVIVAL, false,
                 Difficulty.NORMAL, false, new GameRules(), DataConfiguration.SAFE_MODE);
+        //?}
+        //? if >=1.21.2 {
+        /*LevelInfo levelInfo = new LevelInfo(levelName, GameMode.SURVIVAL, false,
+                Difficulty.NORMAL, false, new GameRules(FeatureFlags.DEFAULT_ENABLED_FEATURES), DataConfiguration.SAFE_MODE);
+        *///?}
         try {
-            client.createIntegratedServerLoader().createAndStart(groupId, levelInfo, GeneratorOptions.createRandom(),
+            //? if <1.21.2 {
+            CampfyreWorldCreator.createAndStart(client, groupId, levelInfo, GeneratorOptions.createRandom(),
                     registryManager -> registryManager.get(RegistryKeys.WORLD_PRESET)
                             .entryOf(WorldPresets.DEFAULT).value().createDimensionsRegistryHolder());
+            //?}
+            //? if >=1.21.2 {
+            /*CampfyreWorldCreator.createAndStart(client, groupId, levelInfo, GeneratorOptions.createRandom(),
+                    lookup -> lookup.getOrThrow(RegistryKeys.WORLD_PRESET)
+                            .getOrThrow(WorldPresets.DEFAULT).value().createDimensionsRegistryHolder());
+            *///?}
         } catch (Exception e) {
             // Same reasoning as startWorldGuarded: don't let a failure here
             // vanish into vanilla's silent task runner.
@@ -1846,7 +1916,12 @@ public class CampfyreClient implements ClientModInitializer {
     private void sendWorldSettingsReport(MinecraftServer server) {
         JsonObject gamerules = new JsonObject();
         for (CuratedGameRule rule : CURATED_GAME_RULES) {
+            //? if <1.21.11 {
             gamerules.addProperty(rule.key().getName(), server.getGameRules().get(rule.key()).get());
+            //?}
+            //? if >=1.21.11 {
+            /*gamerules.addProperty(rule.key().getId().getPath(), server.getOverworld().getGameRules().getValue(rule.key()));
+            *///?}
         }
         var overworld = server.getOverworld();
 
@@ -1898,13 +1973,23 @@ public class CampfyreClient implements ClientModInitializer {
     private void applyOwnerSettingsChange(MinecraftServer server, String action, com.google.gson.JsonElement value) {
         switch (action) {
             case "gamemode_self" -> {
+                //? if <1.21.5 {
                 GameMode mode = GameMode.byName(value.getAsString(), GameMode.SURVIVAL);
+                //?}
+                //? if >=1.21.5 {
+                /*GameMode mode = GameMode.byId(value.getAsString(), GameMode.SURVIVAL);
+                *///?}
                 ServerPlayerEntity owner = server.getPlayerManager().getPlayer(UUID.fromString(ownerId));
                 if (owner != null) owner.changeGameMode(mode);
                 else System.out.println("[Campfyre] Owner isn't connected to this world right now - can't set their game mode.");
             }
             case "gamemode_all" -> {
+                //? if <1.21.5 {
                 GameMode mode = GameMode.byName(value.getAsString(), GameMode.SURVIVAL);
+                //?}
+                //? if >=1.21.5 {
+                /*GameMode mode = GameMode.byId(value.getAsString(), GameMode.SURVIVAL);
+                *///?}
                 for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                     player.changeGameMode(mode);
                 }
@@ -1929,12 +2014,22 @@ public class CampfyreClient implements ClientModInitializer {
                 JsonObject obj = value.getAsJsonObject();
                 String ruleName = obj.get("rule").getAsString();
                 boolean enabled = obj.get("enabled").getAsBoolean();
+                //? if <1.21.11 {
                 CURATED_GAME_RULES.stream()
                         .filter(r -> r.key().getName().equals(ruleName))
                         .findFirst()
                         .ifPresentOrElse(
                                 r -> server.getGameRules().get(r.key()).set(enabled, server),
                                 () -> System.out.println("[Campfyre] Unknown gamerule '" + ruleName + "' in owner_settings_change"));
+                //?}
+                //? if >=1.21.11 {
+                /*CURATED_GAME_RULES.stream()
+                        .filter(r -> r.key().getId().getPath().equals(ruleName))
+                        .findFirst()
+                        .ifPresentOrElse(
+                                r -> server.getOverworld().getGameRules().setValue(r.key(), enabled, server),
+                                () -> System.out.println("[Campfyre] Unknown gamerule '" + ruleName + "' in owner_settings_change"));
+                *///?}
             }
             default -> System.out.println("[Campfyre] Unknown owner_settings_change action: " + action);
         }
@@ -1958,12 +2053,22 @@ public class CampfyreClient implements ClientModInitializer {
         sendOwnerSettingsChange("difficulty", new com.google.gson.JsonPrimitive(difficulty.name()));
     }
 
+    //? if <1.21.11 {
     void sendGameRuleChange(GameRules.Key<GameRules.BooleanRule> key, boolean enabled) {
         JsonObject value = new JsonObject();
         value.addProperty("rule", key.getName());
         value.addProperty("enabled", enabled);
         sendOwnerSettingsChange("gamerule", value);
     }
+    //?}
+    //? if >=1.21.11 {
+    /*void sendGameRuleChange(GameRule<Boolean> key, boolean enabled) {
+        JsonObject value = new JsonObject();
+        value.addProperty("rule", key.getId().getPath());
+        value.addProperty("enabled", enabled);
+        sendOwnerSettingsChange("gamerule", value);
+    }
+    *///?}
 
     private void sendOwnerSettingsChange(String action, com.google.gson.JsonElement value) {
         JsonObject msg = new JsonObject();
@@ -2145,8 +2250,8 @@ public class CampfyreClient implements ClientModInitializer {
         client.execute(() -> {
             String addr = host + ":" + port;
             ServerAddress address = ServerAddress.parse(addr);
-            ServerInfo info = new ServerInfo("Campfyre", addr, false);
-            ConnectScreen.connect(new TitleScreen(), client, address, info, false);
+            ServerInfo info = CampfyreConnect.makeServerInfo("Campfyre", addr);
+            CampfyreConnect.connect(new TitleScreen(), client, address, info);
         });
     }
 
@@ -2354,8 +2459,8 @@ public class CampfyreClient implements ClientModInitializer {
         client.execute(() -> {
             String addr = "127.0.0.1:" + PUNCH_BRIDGE_PORT;
             ServerAddress address = ServerAddress.parse(addr);
-            ServerInfo info = new ServerInfo("Campfyre (direct)", addr, false);
-            ConnectScreen.connect(new TitleScreen(), client, address, info, false);
+            ServerInfo info = CampfyreConnect.makeServerInfo("Campfyre (direct)", addr);
+            CampfyreConnect.connect(new TitleScreen(), client, address, info);
         });
     }
 
@@ -2370,8 +2475,8 @@ public class CampfyreClient implements ClientModInitializer {
         client.execute(() -> {
             String addr = "127.0.0.1:" + RELAY_LISTEN_PORT;
             ServerAddress address = ServerAddress.parse(addr);
-            ServerInfo info = new ServerInfo("Campfyre Relay", addr, false);
-            ConnectScreen.connect(new TitleScreen(), client, address, info, false);
+            ServerInfo info = CampfyreConnect.makeServerInfo("Campfyre Relay", addr);
+            CampfyreConnect.connect(new TitleScreen(), client, address, info);
         });
     }
 
@@ -2847,7 +2952,12 @@ public class CampfyreClient implements ClientModInitializer {
         CountDownLatch latch = new CountDownLatch(1);
         internalRestartLatch = latch;
 
+        //? if <1.21.6 {
         MinecraftClient.getInstance().execute(() -> MinecraftClient.getInstance().disconnect());
+        //?}
+        //? if >=1.21.6 {
+        /*MinecraftClient.getInstance().execute(() -> MinecraftClient.getInstance().disconnectWithSavingScreen());
+        *///?}
 
         try {
             if (!latch.await(30, TimeUnit.SECONDS)) {
@@ -3029,8 +3139,13 @@ public class CampfyreClient implements ClientModInitializer {
     // whatever name they already had.
     private static String readWorldDisplayName(Path worldDir) {
         try {
-            NbtCompound root = NbtIo.readCompressed(worldDir.resolve("level.dat").toFile());
+            NbtCompound root = CampfyreNbtCompat.readCompressed(worldDir.resolve("level.dat").toFile());
+            //? if <1.21.5 {
             String name = root.getCompound("Data").getString("LevelName");
+            //?}
+            //? if >=1.21.5 {
+            /*String name = root.getCompoundOrEmpty("Data").getString("LevelName").orElse(null);
+            *///?}
             return name == null || name.isBlank() ? null : name;
         } catch (Exception e) {
             return null;
@@ -3156,14 +3271,24 @@ public class CampfyreClient implements ClientModInitializer {
                 return;
             }
 
-            NbtCompound root = NbtIo.readCompressed(levelDatFile);
+            NbtCompound root = CampfyreNbtCompat.readCompressed(levelDatFile);
+            //? if <1.21.5 {
             NbtCompound data = root.getCompound("Data");
+            //?}
+            //? if >=1.21.5 {
+            /*NbtCompound data = root.getCompoundOrEmpty("Data");
+            *///?}
 
             Path playerDataDir = worldDir.resolve("playerdata");
             Files.createDirectories(playerDataDir);
 
             if (data.contains("Player")) {
+                //? if <1.21.5 {
                 NbtCompound outgoingPlayerData = data.getCompound("Player");
+                //?}
+                //? if >=1.21.5 {
+                /*NbtCompound outgoingPlayerData = data.getCompoundOrEmpty("Player");
+                *///?}
                 // Whose data is this? Trust the NBT itself first: the Player
                 // compound carries its owner's UUID (4-int array in 1.20),
                 // and that's ground truth no matter which code path got us
@@ -3176,7 +3301,7 @@ public class CampfyreClient implements ClientModInitializer {
                 if (ownerId == null) ownerId = outgoingHostId;
                 if (ownerId != null) {
                     File outgoingFile = playerDataDir.resolve(ownerId + ".dat").toFile();
-                    NbtIo.writeCompressed(outgoingPlayerData, outgoingFile);
+                    CampfyreNbtCompat.writeCompressed(outgoingPlayerData, outgoingFile);
                     System.out.println("[Campfyre] Preserved previous host's player data -> " + outgoingFile.getName());
                 } else {
                     System.out.println("[Campfyre] Player data in level.dat has no UUID and no hint - can't preserve it.");
@@ -3187,7 +3312,7 @@ public class CampfyreClient implements ClientModInitializer {
 
             File incomingFile = playerDataDir.resolve(incomingHostId + ".dat").toFile();
             if (incomingFile.exists()) {
-                NbtCompound incomingPlayerData = NbtIo.readCompressed(incomingFile);
+                NbtCompound incomingPlayerData = CampfyreNbtCompat.readCompressed(incomingFile);
                 data.put("Player", incomingPlayerData);
                 System.out.println("[Campfyre] Restored incoming host's own player data into level.dat.");
             } else {
@@ -3196,7 +3321,7 @@ public class CampfyreClient implements ClientModInitializer {
             }
 
             root.put("Data", data);
-            NbtIo.writeCompressed(root, levelDatFile);
+            CampfyreNbtCompat.writeCompressed(root, levelDatFile);
             System.out.println("[Campfyre] Player-data swap complete.");
     }
 
@@ -3205,7 +3330,12 @@ public class CampfyreClient implements ClientModInitializer {
     // string form - the same shape playerdata/<uuid>.dat filenames use -
     // or null if the tag is missing/malformed.
     private static String readPlayerUuid(NbtCompound playerData) {
+        //? if <1.21.5 {
         int[] parts = playerData.getIntArray("UUID");
+        //?}
+        //? if >=1.21.5 {
+        /*int[] parts = playerData.getIntArray("UUID").orElse(new int[0]);
+        *///?}
         if (parts.length != 4) return null;
         long most = ((long) parts[0] << 32) | (parts[1] & 0xFFFFFFFFL);
         long least = ((long) parts[2] << 32) | (parts[3] & 0xFFFFFFFFL);

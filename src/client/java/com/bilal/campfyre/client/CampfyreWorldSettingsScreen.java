@@ -9,7 +9,12 @@ import net.minecraft.client.gui.widget.ElementListWidget;
 import net.minecraft.text.Text;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.GameMode;
+//? if <1.21.11 {
 import net.minecraft.world.GameRules;
+//?}
+//? if >=1.21.11 {
+/*import net.minecraft.world.rule.GameRule;
+*///?}
 
 import java.util.List;
 
@@ -69,7 +74,12 @@ public class CampfyreWorldSettingsScreen extends Screen {
         builtWithSomeoneHosting = mod.isSomeoneHosting();
         if (builtWithSomeoneHosting) {
             list = new SettingsList(this.client, ROW_WIDTH, this.height, panelTop + 34, panelBottom - 30, ITEM_HEIGHT, mod);
+            //? if <1.20.3 {
             list.setLeftPos(centerX - ROW_WIDTH / 2);
+            //?}
+            //? if >=1.20.3 {
+            /*list.setX(centerX - ROW_WIDTH / 2);
+            *///?}
             this.addDrawableChild(list);
         } else {
             list = null;
@@ -124,8 +134,15 @@ public class CampfyreWorldSettingsScreen extends Screen {
 
     private static final class SettingsList extends ElementListWidget<SettingsList.Row> {
         SettingsList(MinecraftClient client, int width, int height, int top, int bottom, int itemHeight, CampfyreClient mod) {
+            //? if <1.20.3 {
             super(client, width, height, top, bottom, itemHeight);
+            //?}
+            //? if >=1.20.3 {
+            /*super(client, width, bottom - top, top, itemHeight);
+            *///?}
+            //? if <1.20.5 {
             setRenderBackground(false);
+            //?}
             buildRows(mod);
         }
 
@@ -134,10 +151,27 @@ public class CampfyreWorldSettingsScreen extends Screen {
             return ROW_WIDTH;
         }
 
+        // drawMenuListBackground draws vanilla's own textured list panel behind
+        // the rows - CampfyreUi already draws this screen's card panel, so this
+        // stays empty rather than layering a second background under it.
+        //? if >=1.20.5 {
+        /*@Override
+        protected void drawMenuListBackground(DrawContext context) {
+        }
+        *///?}
+
+        //? if <1.20.5 {
         @Override
         protected int getScrollbarPositionX() {
             return this.getRowRight() + 6;
         }
+        //?}
+        //? if >=1.20.5 {
+        /*@Override
+        protected int getScrollbarX() {
+            return this.getRowRight() + 6;
+        }
+        *///?}
 
         private void buildRows(CampfyreClient mod) {
             addEntry(Row.actionRow("My Mode", modeButtons(mod, false)));
@@ -162,12 +196,22 @@ public class CampfyreWorldSettingsScreen extends Screen {
             }
         }
 
+        //? if <1.21.11 {
         private static boolean currentGameRuleValue(CampfyreClient mod, GameRules.Key<GameRules.BooleanRule> key) {
             CampfyreClient.WorldSettingsSnapshot snapshot = mod.getWorldSettings();
             if (snapshot == null) return false;
             Boolean value = snapshot.gamerules().get(key.getName());
             return value != null && value;
         }
+        //?}
+        //? if >=1.21.11 {
+        /*private static boolean currentGameRuleValue(CampfyreClient mod, GameRule<Boolean> key) {
+            CampfyreClient.WorldSettingsSnapshot snapshot = mod.getWorldSettings();
+            if (snapshot == null) return false;
+            Boolean value = snapshot.gamerules().get(key.getId().getPath());
+            return value != null && value;
+        }
+        *///?}
 
         private static List<CampfyreButton> modeButtons(CampfyreClient mod, boolean everyone) {
             return List.of(
@@ -218,9 +262,27 @@ public class CampfyreWorldSettingsScreen extends Screen {
                         toggle.setMessage(Text.literal(currentValue.getAsBoolean() ? "ON" : "OFF")));
             }
 
+            //? if <1.21.9 {
             @Override
             public void render(DrawContext context, int index, int y, int x, int entryWidth, int entryHeight,
                                 int mouseX, int mouseY, boolean hovered, float tickDelta) {
+                renderRow(context, x, y, entryWidth, entryHeight, mouseX, mouseY, hovered, tickDelta);
+            }
+            //?}
+            //? if >=1.21.9 {
+            /*// The entry no longer receives its own x/y/width/height - it
+            // tracks them itself (setX/setY/setWidth/setHeight, called by the
+            // parent list) and render() only gets the frame's mouse position -
+            // verified via javap: EntryListWidget.renderEntry now calls
+            // entry.render(context, mouseX, mouseY, hovered, tickDelta).
+            @Override
+            public void render(DrawContext context, int mouseX, int mouseY, boolean hovered, float tickDelta) {
+                renderRow(context, getX(), getY(), getWidth(), getHeight(), mouseX, mouseY, hovered, tickDelta);
+            }
+            *///?}
+
+            private void renderRow(DrawContext context, int x, int y, int entryWidth, int entryHeight,
+                                    int mouseX, int mouseY, boolean hovered, float tickDelta) {
                 if (refresh != null) refresh.run();
 
                 var tr = MinecraftClient.getInstance().textRenderer;

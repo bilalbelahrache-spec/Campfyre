@@ -47,7 +47,13 @@ final class CampfyreHud {
         }
 
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.options.debugEnabled) return; // stay out of the F3 overlay's way
+        // stay out of the F3 overlay's way
+        //? if <1.20.2 {
+        if (client.options.debugEnabled) return;
+        //?}
+        //? if >=1.20.2 {
+        /*if (client.inGameHud.getDebugHud().shouldShowDebugHud()) return;
+        *///?}
         String detail = mod.describeHudDetail();
 
         // Any change in what the badge would say earns it a fresh few seconds

@@ -1,0 +1,138 @@
+# See https://stonecutter.kikugie.dev/wiki/config/properties#centralized-properties
+mod.id = "campfyre"
+mod.name = "Campfyre"
+mod.group = "com.bilal.campfyre"
+mod.version = "1.0.0"
+
+deps.fabric_loader = "0.19.3"
+loom_version = "1.17-SNAPSHOT"
+
+["1.20.1"]
+yarn_mappings = "1.20.1+build.10"
+deps.fabric_api = "0.92.9+1.20.1"
+# Mod compatibility range in fabric.mod.json
+mod.mc_compat = "~1.20.1"
+# List of releases to be marked compatible on Modrinth/Curseforge
+mod.mc_releases = ["1.20.1"]
+# JDK required to compile/run this version, and the matching Mixin compatibilityLevel
+deps.java = "17"
+
+["1.20.2"]
+yarn_mappings = "1.20.2+build.4"
+deps.fabric_api = "0.91.6+1.20.2"
+mod.mc_compat = "~1.20.2"
+mod.mc_releases = ["1.20.2"]
+deps.java = "17"
+
+["1.20.3"]
+yarn_mappings = "1.20.3+build.1"
+deps.fabric_api = "0.91.1+1.20.3"
+mod.mc_compat = "~1.20.3"
+mod.mc_releases = ["1.20.3"]
+deps.java = "17"
+
+["1.20.4"]
+yarn_mappings = "1.20.4+build.3"
+deps.fabric_api = "0.97.3+1.20.4"
+mod.mc_compat = "~1.20.4"
+mod.mc_releases = ["1.20.4"]
+deps.java = "17"
+
+["1.20.5"]
+yarn_mappings = "1.20.5+build.1"
+deps.fabric_api = "0.97.8+1.20.5"
+mod.mc_compat = "~1.20.5"
+mod.mc_releases = ["1.20.5"]
+# First version requiring JDK 21 (item data-components / MatrixStack rewrite)
+deps.java = "21"
+
+["1.20.6"]
+yarn_mappings = "1.20.6+build.3"
+deps.fabric_api = "0.100.8+1.20.6"
+mod.mc_compat = "~1.20.6"
+mod.mc_releases = ["1.20.6"]
+deps.java = "21"
+
+["1.21"]
+yarn_mappings = "1.21+build.9"
+deps.fabric_api = "0.102.0+1.21"
+mod.mc_compat = "~1.21"
+mod.mc_releases = ["1.21"]
+deps.java = "21"
+
+["1.21.1"]
+yarn_mappings = "1.21.1+build.3"
+deps.fabric_api = "0.116.13+1.21.1"
+mod.mc_compat = "~1.21.1"
+mod.mc_releases = ["1.21.1"]
+deps.java = "21"
+
+["1.21.2"]
+yarn_mappings = "1.21.2+build.1"
+deps.fabric_api = "0.106.1+1.21.2"
+mod.mc_compat = "~1.21.2"
+mod.mc_releases = ["1.21.2"]
+deps.java = "21"
+
+["1.21.3"]
+yarn_mappings = "1.21.3+build.2"
+deps.fabric_api = "0.114.1+1.21.3"
+mod.mc_compat = "~1.21.3"
+mod.mc_releases = ["1.21.3"]
+deps.java = "21"
+
+["1.21.4"]
+yarn_mappings = "1.21.4+build.8"
+deps.fabric_api = "0.119.4+1.21.4"
+mod.mc_compat = "~1.21.4"
+mod.mc_releases = ["1.21.4"]
+deps.java = "21"
+
+["1.21.5"]
+yarn_mappings = "1.21.5+build.1"
+deps.fabric_api = "0.128.2+1.21.5"
+mod.mc_compat = "~1.21.5"
+mod.mc_releases = ["1.21.5"]
+deps.java = "21"
+
+["1.21.6"]
+yarn_mappings = "1.21.6+build.1"
+deps.fabric_api = "0.128.2+1.21.6"
+mod.mc_compat = "~1.21.6"
+mod.mc_releases = ["1.21.6"]
+deps.java = "21"
+
+["1.21.7"]
+yarn_mappings = "1.21.7+build.8"
+deps.fabric_api = "0.129.0+1.21.7"
+mod.mc_compat = "~1.21.7"
+mod.mc_releases = ["1.21.7"]
+deps.java = "21"
+
+["1.21.8"]
+yarn_mappings = "1.21.8+build.1"
+deps.fabric_api = "0.136.1+1.21.8"
+mod.mc_compat = "~1.21.8"
+mod.mc_releases = ["1.21.8"]
+deps.java = "21"
+
+["1.21.9"]
+yarn_mappings = "1.21.9+build.1"
+deps.fabric_api = "0.134.1+1.21.9"
+mod.mc_compat = "~1.21.9"
+mod.mc_releases = ["1.21.9"]
+deps.java = "21"
+
+["1.21.10"]
+yarn_mappings = "1.21.10+build.3"
+deps.fabric_api = "0.138.4+1.21.10"
+mod.mc_compat = "~1.21.10"
+mod.mc_releases = ["1.21.10"]
+deps.java = "21"
+
+["1.21.11"]
+yarn_mappings = "1.21.11+build.6"
+deps.fabric_api = "0.141.4+1.21.11"
+mod.mc_compat = "~1.21.11"
+mod.mc_releases = ["1.21.11"]
+deps.java = "21"

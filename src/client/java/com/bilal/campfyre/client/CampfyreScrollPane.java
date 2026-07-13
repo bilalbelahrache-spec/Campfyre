@@ -1,6 +1,9 @@
 package com.bilal.campfyre.client;
 
 import net.minecraft.client.gui.DrawContext;
+//? if >=1.21.9 {
+/*import net.minecraft.client.gui.Click;
+*///?}
 import net.minecraft.client.gui.screen.narration.NarrationMessageBuilder;
 import net.minecraft.client.gui.screen.narration.NarrationPart;
 import net.minecraft.client.gui.widget.ClickableWidget;
@@ -98,8 +101,20 @@ class CampfyreScrollPane extends ClickableWidget {
         return maxScroll() > 0 ? SCROLLBAR_WIDTH + SCROLLBAR_GAP : 0;
     }
 
+    //? if <1.20.3 {
     @Override
     protected void renderButton(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderScrollPane(context, mouseX, mouseY, delta);
+    }
+    //?}
+    //? if >=1.20.3 {
+    /*@Override
+    protected void renderWidget(DrawContext context, int mouseX, int mouseY, float delta) {
+        renderScrollPane(context, mouseX, mouseY, delta);
+    }
+    *///?}
+
+    private void renderScrollPane(DrawContext context, int mouseX, int mouseY, float delta) {
         int x = getX();
         int y = getY();
         int w = getWidth();
@@ -136,14 +151,25 @@ class CampfyreScrollPane extends ClickableWidget {
                     rowAlpha = CampfyreUi.easeOutCubic(CampfyreUi.progress(start, ROW_FADE_MS));
                 }
                 if (rowAlpha > 0.02F) {
+                    //? if <1.21.6 {
                     context.getMatrices().push();
                     context.getMatrices().translate(0.0, (1.0F - rowAlpha) * 4.0, 0.0);
+                    //?}
+                    //? if >=1.21.6 {
+                    /*context.getMatrices().pushMatrix();
+                    context.getMatrices().translate(0.0F, (1.0F - rowAlpha) * 4.0F);
+                    *///?}
                     // Row's x/width match the frame onClick's mouseX is
                     // translated into (both relative to getX()) - rows add
                     // their own small internal padding rather than this pane
                     // insetting for them, so the two frames can't drift.
                     row.render(context, x, rowY, w - reserve, mouseX, mouseY, hovered, delta);
+                    //? if <1.21.6 {
                     context.getMatrices().pop();
+                    //?}
+                    //? if >=1.21.6 {
+                    /*context.getMatrices().popMatrix();
+                    *///?}
                 }
                 if (index < visible.size() - 1) {
                     context.fill(x, rowY + rowHeight - 1, x + w - reserve, rowY + rowHeight, CampfyreUi.ROW_DIVIDER);
@@ -165,15 +191,41 @@ class CampfyreScrollPane extends ClickableWidget {
         }
     }
 
+    //? if <1.20.2 {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double amount) {
+        return scrollByWheel(mouseX, mouseY, amount);
+    }
+    //?}
+    //? if >=1.20.2 {
+    /*@Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double amountX, double amountY) {
+        // Vertical-only list, so the horizontal delta (introduced alongside this
+        // wider signature) has nothing to scroll - only amountY is used.
+        return scrollByWheel(mouseX, mouseY, amountY);
+    }
+    *///?}
+
+    private boolean scrollByWheel(double mouseX, double mouseY, double amount) {
         if (!isMouseOver(mouseX, mouseY)) return false;
         scrollTarget = MathHelper.clamp(scrollTarget - amount * WHEEL_ROW_UNIT, 0, maxScroll());
         return true;
     }
 
+    //? if <1.21.9 {
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        return handleMouseClicked(mouseX, mouseY, button);
+    }
+    //?}
+    //? if >=1.21.9 {
+    /*@Override
+    public boolean mouseClicked(Click click, boolean doubled) {
+        return handleMouseClicked(click.x(), click.y(), click.button());
+    }
+    *///?}
+
+    private boolean handleMouseClicked(double mouseX, double mouseY, int button) {
         if (!active || !visible || !isMouseOver(mouseX, mouseY)) return false;
 
         double max = maxScroll();
@@ -204,8 +256,20 @@ class CampfyreScrollPane extends ClickableWidget {
         return true;
     }
 
+    //? if <1.21.9 {
     @Override
     public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+        return handleMouseDragged(mouseX, mouseY, deltaX, deltaY);
+    }
+    //?}
+    //? if >=1.21.9 {
+    /*@Override
+    public boolean mouseDragged(Click click, double deltaX, double deltaY) {
+        return handleMouseDragged(click.x(), click.y(), deltaX, deltaY);
+    }
+    *///?}
+
+    private boolean handleMouseDragged(double mouseX, double mouseY, double deltaX, double deltaY) {
         if (!draggingThumb) return false;
         double max = maxScroll();
         if (max <= 0) return true;
@@ -218,8 +282,20 @@ class CampfyreScrollPane extends ClickableWidget {
         return true;
     }
 
+    //? if <1.21.9 {
     @Override
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        return handleMouseReleased();
+    }
+    //?}
+    //? if >=1.21.9 {
+    /*@Override
+    public boolean mouseReleased(Click click) {
+        return handleMouseReleased();
+    }
+    *///?}
+
+    private boolean handleMouseReleased() {
         if (draggingThumb) {
             draggingThumb = false;
             return true;
@@ -227,8 +303,20 @@ class CampfyreScrollPane extends ClickableWidget {
         return false;
     }
 
+    //? if <1.21.9 {
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        return handleKeyPressed(keyCode);
+    }
+    //?}
+    //? if >=1.21.9 {
+    /*@Override
+    public boolean keyPressed(net.minecraft.client.input.KeyInput input) {
+        return handleKeyPressed(input.key());
+    }
+    *///?}
+
+    private boolean handleKeyPressed(int keyCode) {
         if (!isFocused()) return false;
         double max = maxScroll();
         if (max <= 0) return false;

@@ -4,8 +4,19 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.client.font.TextRenderer;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.RotatingCubeMapRenderer;
+//? if <1.20.5 {
 import net.minecraft.client.gui.screen.TitleScreen;
+//?}
+//? if >=1.20.5 {
+/*import net.minecraft.client.gui.CubeMapRenderer;
+*///?}
 import net.minecraft.client.gui.widget.TextFieldWidget;
+//? if >=1.21.2 <1.21.6 {
+/*import net.minecraft.client.render.RenderLayer;
+*///?}
+//? if >=1.21.6 {
+/*import net.minecraft.client.gl.RenderPipelines;
+*///?}
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
@@ -120,8 +131,23 @@ public final class CampfyreUi {
     // middle of the screen), which bled ghost button text through the dim
     // scrim. Rendering just the background ourselves sidesteps that - same
     // authentic vanilla panorama, no foreign widgets underneath.
+    //? if <1.20.5 {
     private static final RotatingCubeMapRenderer PANORAMA = new RotatingCubeMapRenderer(TitleScreen.PANORAMA_CUBE_MAP);
+    //?}
+    //? if >=1.20.5 <1.21 {
+    /*private static final RotatingCubeMapRenderer PANORAMA = new RotatingCubeMapRenderer(
+            new CubeMapRenderer(new Identifier("textures/gui/title/background/panorama")));
+    *///?}
+    //? if >=1.21 {
+    /*private static final RotatingCubeMapRenderer PANORAMA = new RotatingCubeMapRenderer(
+            new CubeMapRenderer(Identifier.of("textures/gui/title/background/panorama")));
+    *///?}
+    //? if <1.21 {
     private static final Identifier PANORAMA_OVERLAY = new Identifier("textures/gui/title/background/panorama_overlay.png");
+    //?}
+    //? if >=1.21 {
+    /*private static final Identifier PANORAMA_OVERLAY = Identifier.of("textures/gui/title/background/panorama_overlay.png");
+    *///?}
 
     // A small campfyre: a two-tone flame over a two-tone log base. -1 means
     // "skip this row". 12 wide x 10 tall.
@@ -166,10 +192,36 @@ public final class CampfyreUi {
             context.fillGradient(0, 0, width, height, 0xC0101010, 0xD0101010);
             return;
         }
+        //? if <1.20.5 {
         PANORAMA.render(delta, 1.0F);
+        //?}
+        //? if >=1.20.5 <1.21.6 {
+        /*PANORAMA.render(context, width, height, 1.0F, delta);
+        *///?}
+        //? if >=1.21.6 {
+        /*PANORAMA.render(context, width, height, true);
+        *///?}
+        //? if <1.21.5 {
         RenderSystem.enableBlend();
+        //?}
+        // RenderSystem.enableBlend() was removed at 1.21.5 with no direct
+        // replacement - blending is baked into the GUI_TEXTURED render layer's
+        // own pipeline definition from here on (verified via javap: vanilla's
+        // own Screen.renderPanoramaBackground no longer calls it either).
+        //? if <1.21.2 {
         context.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
         context.drawTexture(PANORAMA_OVERLAY, 0, 0, width, height, 0.0F, 0.0F, 16, 128, 16, 128);
+        //?}
+        //? if >=1.21.2 <1.21.6 {
+        /*RenderSystem.setShaderColor(1.0F, 1.0F, 1.0F, 1.0F);
+        context.drawTexture(RenderLayer::getGuiTextured, PANORAMA_OVERLAY, 0, 0, 0.0F, 0.0F, width, height, 16, 128, 16, 128);
+        *///?}
+        //? if >=1.21.6 {
+        /*// RenderSystem.setShaderColor was removed too, with no replacement -
+        // our calls only ever reset it to opaque white (the pipeline's own
+        // default), so dropping the call changes nothing.
+        context.drawTexture(RenderPipelines.GUI_TEXTURED, PANORAMA_OVERLAY, 0, 0, 0.0F, 0.0F, width, height, 16, 128, 16, 128);
+        *///?}
         context.fill(0, 0, width, height, 0x99000000);
     }
 
@@ -184,7 +236,12 @@ public final class CampfyreUi {
     static void drawPanel(DrawContext context, int left, int top, int right, int bottom) {
         context.fill(left + 3, top + 4, right + 3, bottom + 4, SHADOW);
         int glowAlpha = 45 + (int) (35 * breathe(BREATHE_PERIOD_MS));
+        //? if <1.21.9 {
         context.drawBorder(left - 4, top - 4, (right - left) + 8, (bottom - top) + 8, withAlpha(ACCENT & 0xFFFFFF, glowAlpha));
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(left - 4, top - 4, (right - left) + 8, (bottom - top) + 8, withAlpha(ACCENT & 0xFFFFFF, glowAlpha));
+        *///?}
         context.fill(left - 2, top - 2, right + 2, bottom + 2, PANEL_BORDER_OUTER);
         context.fill(left - 1, top - 1, right + 1, bottom + 1, PANEL_BORDER_INNER);
         context.fillGradient(left, top, right, bottom, PANEL_BG_TOP, PANEL_BG);
@@ -250,11 +307,27 @@ public final class CampfyreUi {
 
     /** The same animated campfyre, scaled up - the hero mark on the setup screen. */
     static void drawCampfyreIconScaled(DrawContext context, int left, int top, float scale) {
+        //? if <1.21.6 {
         context.getMatrices().push();
         context.getMatrices().translate(left, top, 0);
         context.getMatrices().scale(scale, scale, 1.0F);
+        //?}
+        //? if >=1.21.6 {
+        /*// DrawContext.getMatrices() dropped from a 3D MatrixStack to a 2D-only
+        // Matrix3x2fStack at 1.21.6 - push/pop renamed pushMatrix/popMatrix,
+        // translate/scale lost their now-meaningless Z argument (verified via
+        // javap against JOML's Matrix3x2f/Matrix3x2fStack in the mapped jar).
+        context.getMatrices().pushMatrix();
+        context.getMatrices().translate((float) left, (float) top);
+        context.getMatrices().scale(scale, scale);
+        *///?}
         drawCampfyreIcon(context, 0, 0);
+        //? if <1.21.6 {
         context.getMatrices().pop();
+        //?}
+        //? if >=1.21.6 {
+        /*context.getMatrices().popMatrix();
+        *///?}
     }
 
     /**
@@ -299,7 +372,12 @@ public final class CampfyreUi {
     /** Inset well for showcased content (the invite code) - darker than the panel, thin accent frame. */
     static void drawInnerBox(DrawContext context, int left, int top, int right, int bottom) {
         context.fill(left, top, right, bottom, INNER_BOX_BG);
+        //? if <1.21.9 {
         context.drawBorder(left, top, right - left, bottom - top, withAlpha(ACCENT & 0xFFFFFF, 90));
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(left, top, right - left, bottom - top, withAlpha(ACCENT & 0xFFFFFF, 90));
+        *///?}
     }
 
     /**
@@ -328,8 +406,14 @@ public final class CampfyreUi {
     static void drawChip(DrawContext context, TextRenderer tr, String label, int x, int y, int height, int textColor, boolean accent) {
         int width = chipWidth(tr, label);
         context.fill(x, y, x + width, y + height, accent ? CHIP_BG_ACCENT : CHIP_BG);
+        //? if <1.21.9 {
         context.drawBorder(x, y, width, height, accent
                 ? withAlpha(ACCENT & 0xFFFFFF, 170) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 160));
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(x, y, width, height, accent
+                ? withAlpha(ACCENT & 0xFFFFFF, 170) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 160));
+        *///?}
         context.drawCenteredTextWithShadow(tr, Text.literal(label), x + width / 2, y + (height - tr.fontHeight) / 2, textColor);
     }
 
@@ -360,7 +444,12 @@ public final class CampfyreUi {
             context.fill(x - 1, y - 1, x + size + 1, y + size + 1, withAlpha(ACCENT & 0xFFFFFF, glowAlpha));
         }
         context.fill(x, y, x + size, y + size, withAlpha(avatarColor(name), 255));
+        //? if <1.21.9 {
         context.drawBorder(x, y, size, size, withAlpha(0x000000, 120));
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(x, y, size, size, withAlpha(0x000000, 120));
+        *///?}
         if (isHost) {
             drawCampfyreIcon(context, x + (size - ICON_WIDTH) / 2, y + (size - ICON_HEIGHT) / 2);
         } else {
@@ -390,8 +479,14 @@ public final class CampfyreUi {
         }
         context.fill(x - 2, y - 2, x + w + 2, y + h + 2, INNER_BOX_BG);
         boolean focused = field.isFocused();
+        //? if <1.21.9 {
         context.drawBorder(x - 2, y - 2, w + 4, h + 4, focused
                 ? withAlpha(FOCUS_RING & 0xFFFFFF, 220) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 150));
+        //?}
+        //? if >=1.21.9 {
+        /*context.drawStrokedRectangle(x - 2, y - 2, w + 4, h + 4, focused
+                ? withAlpha(FOCUS_RING & 0xFFFFFF, 220) : withAlpha(BUTTON_BORDER & 0xFFFFFF, 150));
+        *///?}
     }
 
     // --- v2: scrollbar chrome shared by every CampfyreScrollPane. ----------
