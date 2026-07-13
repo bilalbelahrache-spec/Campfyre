@@ -83,5 +83,3 @@ that breaks or feels off. Open an issue on
 ## License
 
 CC0-1.0 - do whatever you like with it.
-
-yes, that was intentional.
