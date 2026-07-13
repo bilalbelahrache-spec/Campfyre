@@ -95,7 +95,7 @@ public class CampfyreCodeScreen extends Screen {
                 Text.literal(code).formatted(Formatting.BOLD),
                 centerX, panelTop + 54 + slideY, CampfyreUi.TITLE_COLOR);
         context.drawCenteredTextWithShadow(this.textRenderer,
-                Text.literal(this.textRenderer.trimToWidth(mod.getInviteCode(), 250)),
+                Text.literal(CampfyreUi.trimWithEllipsis(this.textRenderer, mod.getInviteCode(), 250)),
                 centerX, panelTop + 69 + slideY, CampfyreUi.MUTED_TEXT);
         renderIgnitionSparks(context, centerX, panelTop + 65);
 

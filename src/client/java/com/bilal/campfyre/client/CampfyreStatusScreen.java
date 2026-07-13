@@ -314,11 +314,11 @@ public class CampfyreStatusScreen extends Screen {
         // explicitly accepted, un-gated path) can set a longer one, and any
         // joiner of that group lands on this exact screen - trim the same
         // way the composite invite line right below already does.
-        String groupIdLabel = this.textRenderer.trimToWidth(mod.getGroupId(), boxRight - boxLeft - 8);
+        String groupIdLabel = CampfyreUi.trimWithEllipsis(this.textRenderer, mod.getGroupId(), boxRight - boxLeft - 8);
         context.drawCenteredTextWithShadow(this.textRenderer,
                 Text.literal(groupIdLabel).formatted(net.minecraft.util.Formatting.BOLD),
                 boxCenter, top + 6, CampfyreUi.TITLE_COLOR);
-        String composite = this.textRenderer.trimToWidth(mod.getInviteCode(), boxRight - boxLeft - 8);
+        String composite = CampfyreUi.trimWithEllipsis(this.textRenderer, mod.getInviteCode(), boxRight - boxLeft - 8);
         context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(composite),
                 boxCenter, top + 19, CampfyreUi.MUTED_TEXT);
     }

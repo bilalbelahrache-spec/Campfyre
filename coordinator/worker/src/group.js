@@ -50,6 +50,22 @@ const PURGE_AFTER_EMPTY_MS = 270 * 24 * 60 * 60 * 1000;
 // abandoned - sweep its staged chunks.
 const STAGING_TTL_MS = 60 * 60 * 1000;
 
+// Dead-connection detection for the WebSocket side, matching the Node
+// coordinator's own reasoning (see its server.js) rather than trusting
+// Cloudflare's edge to notice a half-open TCP connection on its own -
+// that's real but its timing isn't something this mod controls or can
+// verify. Raw WS-protocol ping/pong frames never reach app code here (the
+// mod's own 20s ws.sendPing keepalive keeps ITS side of the link honest but
+// is invisible to this object), so liveness is tracked at the JSON-message
+// layer instead: any message updates lastSeenMs on the sender's connection
+// attachment, and the mod also sends an explicit no-op 'heartbeat' message
+// on the same schedule so a host with an otherwise-quiet link (no relay
+// traffic, no roster changes) still produces one. A connection silent past
+// HEARTBEAT_STALE_AFTER_MS - roughly two missed heartbeats' worth of slack -
+// is swept and treated as departed, same as a clean disconnect.
+const HEARTBEAT_INTERVAL_MS = 30000;
+const HEARTBEAT_STALE_AFTER_MS = 65000;
+
 // Same 2GB backstop on both the legacy chunked-HTTP upload and the newer
 // WebSocket upload - neither had one, which meant a client could stream
 // parts into Durable Object storage forever. This is not a real-world-size
@@ -154,6 +170,18 @@ export class CampfyreGroup {
     this.env = env;
     this.meta = null; // storage-backed; loaded lazily by loaded()
 
+    // Closes a check-then-act race in the save_upload_begin handler: the
+    // storage.list()-then-put() pair it does to enforce "one upload at a
+    // time" straddles an await, and this isolate DOES interleave a second
+    // webSocketMessage invocation into that gap (single-threaded, but not
+    // synchronous across awaits) - two save_upload_begin messages arriving
+    // close together could otherwise both see zero existing staging rows
+    // and both proceed. A plain in-memory flag, set/checked with no await
+    // between, closes the window; storage remains the actual source of
+    // truth for anything that must survive hibernation, this is only a
+    // same-tick guard. Resets to false on every wake, same as `members`.
+    this.uploadBeginInFlight = false;
+
     // playerId -> WebSocket, rebuilt from the hibernation-surviving sockets
     // and their attachments every time the object wakes up.
     this.members = new Map();
@@ -227,6 +255,30 @@ export class CampfyreGroup {
       await this.setAlarmFor('purge', null);
       await this.purgeIfStillEmpty();
     }
+    if (alarms.heartbeatSweep !== undefined && alarms.heartbeatSweep <= now) {
+      await this.setAlarmFor('heartbeatSweep', null);
+      await this.sweepDeadConnections();
+    }
+  }
+
+  // See HEARTBEAT_STALE_AFTER_MS. Runs off the shared alarm, so it fires even
+  // if this object was fully hibernated the whole interval - unlike an
+  // in-memory setInterval (the Node coordinator's approach), which couldn't
+  // survive that at all.
+  async sweepDeadConnections() {
+    const now = Date.now();
+    const stale = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() || {};
+      if (!att.playerId) continue;
+      if (now - (att.lastSeenMs || 0) > HEARTBEAT_STALE_AFTER_MS) stale.push({ ws, playerId: att.playerId });
+    }
+    for (const { ws, playerId } of stale) {
+      this.log(`${playerId}'s connection has been silent for over ${Math.round(HEARTBEAT_STALE_AFTER_MS / 1000)}s - treating it as dropped`);
+      try { ws.close(1000, 'heartbeat timeout'); } catch { /* already gone */ }
+      await this.handleDeparture(playerId, ws);
+    }
+    if (this.members.size > 0) await this.setAlarmFor('heartbeatSweep', now + HEARTBEAT_INTERVAL_MS);
   }
 
   // ---- fetch routing (everything arrives as an HTTP request, including
@@ -380,6 +432,19 @@ export class CampfyreGroup {
     const meta = await this.loaded();
     const att = ws.deserializeAttachment() || {};
 
+    // Any message at all is a sign of life (matches the Node coordinator's
+    // ws.on('message') touching isAlive) - see sweepDeadConnections. Only
+    // meaningful once hello has attached a playerId; a pre-hello message has
+    // no per-connection liveness to track yet.
+    if (att.playerId) {
+      att.lastSeenMs = Date.now();
+      ws.serializeAttachment(att);
+    }
+
+    if (msg.type === 'heartbeat') {
+      return; // no-op: the touch above is the entire point of this message
+    }
+
     if (msg.type === 'hello') {
       if (!isValidGroupId(msg.groupId) || !isValidPlayerId(msg.playerId)) {
         return this.send(ws, { type: 'error', reason: 'invalid_id' });
@@ -409,7 +474,8 @@ export class CampfyreGroup {
       // the socket itself - this is the DO equivalent of the Node version's
       // per-connection closure variables. Keeps the ip captured at upgrade
       // time too (unused after this point, but cheap to preserve).
-      ws.serializeAttachment({ playerId, ip: att.ip });
+      ws.serializeAttachment({ playerId, ip: att.ip, lastSeenMs: Date.now() });
+      await this.setAlarmFor('heartbeatSweep', Date.now() + HEARTBEAT_INTERVAL_MS);
 
       // A reconnect while the old socket is still lingering: the new socket
       // wins; close the old one quietly so its close event can't later
@@ -557,18 +623,28 @@ export class CampfyreGroup {
       // holds one group's staging rows, so any existing one is this
       // group's) - a legitimate migration never needs two in flight, and
       // without this a client could open unlimited uploadIds and stage
-      // unbounded storage.
-      const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
-      if (existing.size > 0) {
+      // unbounded storage. See uploadBeginInFlight (constructor) for why
+      // this check-then-act needs the extra in-memory guard around it.
+      if (this.uploadBeginInFlight) {
         this.send(ws, { type: 'save_upload_error', reason: 'upload_already_in_progress' });
         return;
       }
-      const uploadId = crypto.randomUUID();
-      await this.ctx.storage.put(`staging:${uploadId}`, { startedMs: Date.now(), chunks: 0, size: 0, partsReceived: 0 });
-      meta.lastUploadActivityMs = Date.now();
-      await this.saveMeta();
-      await this.setAlarmFor('stagingSweep', Date.now() + STAGING_TTL_MS);
-      this.send(ws, { type: 'save_upload_begin_ack', uploadId });
+      this.uploadBeginInFlight = true;
+      try {
+        const existing = await this.ctx.storage.list({ prefix: 'staging:', limit: 1 });
+        if (existing.size > 0) {
+          this.send(ws, { type: 'save_upload_error', reason: 'upload_already_in_progress' });
+          return;
+        }
+        const uploadId = crypto.randomUUID();
+        await this.ctx.storage.put(`staging:${uploadId}`, { startedMs: Date.now(), chunks: 0, size: 0, partsReceived: 0 });
+        meta.lastUploadActivityMs = Date.now();
+        await this.saveMeta();
+        await this.setAlarmFor('stagingSweep', Date.now() + STAGING_TTL_MS);
+        this.send(ws, { type: 'save_upload_begin_ack', uploadId });
+      } finally {
+        this.uploadBeginInFlight = false;
+      }
       return;
     }
 

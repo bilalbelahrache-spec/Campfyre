@@ -632,6 +632,14 @@ public class CampfyreClient implements ClientModInitializer {
             // a dying socket - the silence check below (or the listener's
             // own onError) reaps it
         }
+        // The raw WS-protocol ping above is invisible to the Workers
+        // coordinator's app code (it hibernates and only sees JSON
+        // messages) - this app-level no-op is what lets ITS dead-connection
+        // sweep see us as alive. The Node coordinator already sees the ping
+        // frame directly and ignores this message type; harmless either way.
+        JsonObject heartbeat = new JsonObject();
+        heartbeat.addProperty("type", "heartbeat");
+        sendJson(heartbeat);
         long last = lastCoordinatorInboundMs;
         if (last > 0 && System.currentTimeMillis() - last > COORDINATOR_SILENCE_LIMIT_MS) {
             System.out.println("[Campfyre] Coordinator link silent for over " + (COORDINATOR_SILENCE_LIMIT_MS / 1000)

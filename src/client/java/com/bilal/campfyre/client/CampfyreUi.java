@@ -182,6 +182,18 @@ public final class CampfyreUi {
         return y;
     }
 
+    // Plain TextRenderer.trimToWidth silently drops whatever doesn't fit with
+    // no visual sign anything's missing - fine for names, but the invite
+    // code/composite address is the one string a player might actually type
+    // out by hand from a screenshot or a screen share, so a truncated read
+    // needs to look truncated. No-ops (returns the original string) when it
+    // already fits.
+    static String trimWithEllipsis(TextRenderer tr, String text, int maxWidth) {
+        if (tr.getWidth(text) <= maxWidth) return text;
+        int ellipsisWidth = tr.getWidth("...");
+        return tr.trimToWidth(text, Math.max(0, maxWidth - ellipsisWidth)) + "...";
+    }
+
     /** Real animated vanilla panorama, dimmed - the backdrop for every Campfyre screen. */
     static void renderPanoramaBackdrop(DrawContext context, int width, int height, float delta) {
         // In-game (the screens are reachable via the Campfyre keybind now)
