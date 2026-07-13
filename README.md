@@ -73,6 +73,13 @@ If every mob around you suddenly stops and stares straight at you for about 10 s
 a bug - it's a deliberate, extremely rare (roughly 1-in-a-million-per-second-of-play) easter egg.
 It only affects rendering on your own screen and clears itself; nothing to do but enjoy it.
 
+## Found a bug? Have a question?
+
+This is my first mod ever, so please go in expecting rough edges - and tell me about anything
+that breaks or feels off. Open an issue on
+[GitHub](https://github.com/bilalbelahrache-spec/host-migration/issues), or reach out on Discord:
+**@treekh**.
+
 ## License
 
 CC0-1.0 - do whatever you like with it.
