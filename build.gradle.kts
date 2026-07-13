@@ -92,12 +92,14 @@ val mixinCompatibilityLevel = "JAVA_$javaVersion"
 tasks.processResources {
     val modVersion = project.property("mod.version") as String
     val minecraftDependency = sc.properties["mod.mc_compat"] as String
+    val javaDependency = ">=$javaVersion"
     inputs.property("version", modVersion)
     inputs.property("minecraftDependency", minecraftDependency)
+    inputs.property("javaDependency", javaDependency)
     inputs.property("mixinCompatibilityLevel", mixinCompatibilityLevel)
 
     filesMatching("fabric.mod.json") {
-        expand(mapOf("version" to modVersion, "minecraftDependency" to minecraftDependency))
+        expand(mapOf("version" to modVersion, "minecraftDependency" to minecraftDependency, "javaDependency" to javaDependency))
     }
     filesMatching("*.mixins.json") {
         expand(mapOf("mixinCompatibilityLevel" to mixinCompatibilityLevel))

@@ -268,8 +268,22 @@ export class CampfyreGroup {
       if (path === '/save/commit' && request.method === 'POST') return await this.handleUploadCommit(request);
       // The outer Worker pokes this before it starts reading a legacy upload
       // body off the wire, so migration gating knows an upload is coming even
-      // before its bytes finish arriving.
+      // before its bytes finish arriving. It also doubles as the
+      // authorization pre-check for that upload: the Worker can't tell
+      // whether a caller is the current host without asking us, and
+      // handleLegacyUpload's own checks only run AFTER the Worker has
+      // already parsed the full multipart body (up to Cloudflare's ~100MB
+      // cap) - an unauthenticated caller could otherwise force that parse
+      // cost on every POST to any group id before ever being rejected. By
+      // rejecting here first, the Worker never touches the body for a caller
+      // that was going to be refused anyway.
       if (path === '/save/incoming' && request.method === 'POST') {
+        if (!(await this.checkGroupCreationAllowed(request.headers.get('CF-Connecting-IP')))) {
+          return Response.json({ error: 'rate limited' }, { status: 429 });
+        }
+        if (!this.authorizedUploader(request, meta)) {
+          return Response.json({ error: 'not host' }, { status: 403 });
+        }
         meta.lastUploadActivityMs = Date.now();
         await this.saveMeta();
         return Response.json({ ok: true });

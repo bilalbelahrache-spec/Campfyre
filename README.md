@@ -2,9 +2,10 @@
 
 **Share one Minecraft world with your whole friend group - no server rental, no port forwarding, no one stuck being "the host."**
 
-Campfyre is a Fabric client mod for Minecraft 1.20.1. Your group's world lives with whoever is
-playing: when the current host quits, the save automatically hands off to whoever's next, and
-everyone else reconnects to them without touching a thing.
+Campfyre is a Fabric client mod for Minecraft, supporting every release from 1.20.1 through
+1.21.11. Your group's world lives with whoever is playing: when the current host quits, the save
+automatically hands off to whoever's next, and everyone else reconnects to them without touching a
+thing.
 
 ## How it works
 
@@ -25,8 +26,9 @@ Nothing to set up first - every fresh install already points at a free, always-o
 coordinator, so there's no server to rent or config file to edit before you start.
 
 1. Install [Fabric Loader](https://fabricmc.net/use/) and
-   [Fabric API](https://modrinth.com/mod/fabric-api) for Minecraft 1.20.1, then drop the Campfyre
-   jar into your `mods` folder.
+   [Fabric API](https://modrinth.com/mod/fabric-api) matching your Minecraft version (anything from
+   1.20.1 through 1.21.11 works), then drop the Campfyre jar built for that same version into your
+   `mods` folder.
 2. On the title screen, click the **Campfyre** flame button (next to the language button).
 3. **One person** clicks *Light a New Campfyre* and *Light It* - that's it, no address to type
    unless you want one (see "Running your own coordinator" below). You'll get an invite like

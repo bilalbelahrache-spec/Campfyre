@@ -23,7 +23,8 @@ node server.js
 You should see `coordinator listening on :8080` (override with the `PORT` env var).
 
 Check it's alive: open `http://localhost:8080/health` in a browser, or run
-`curl http://localhost:8080/health` - it should say `{"ok":true,"groups":0}`.
+`curl http://localhost:8080/health` - it should say something like
+`{"ok":true,"groups":0,"uptimeSeconds":2,"version":"1.0.0"}`.
 
 ## Verifying the migration logic yourself
 

@@ -215,14 +215,25 @@ public class CampfyreWorldSettingsScreen extends Screen {
 
         private static List<CampfyreButton> modeButtons(CampfyreClient mod, boolean everyone) {
             return List.of(
-                    smallButton("Surv", b -> mod.sendGameModeChange(everyone, GameMode.SURVIVAL)),
-                    smallButton("Creat", b -> mod.sendGameModeChange(everyone, GameMode.CREATIVE)),
-                    smallButton("Adv", b -> mod.sendGameModeChange(everyone, GameMode.ADVENTURE)),
-                    smallButton("Spec", b -> mod.sendGameModeChange(everyone, GameMode.SPECTATOR)));
+                    smallButton("Surv", "Survival", b -> mod.sendGameModeChange(everyone, GameMode.SURVIVAL)),
+                    smallButton("Creat", "Creative", b -> mod.sendGameModeChange(everyone, GameMode.CREATIVE)),
+                    smallButton("Adv", "Adventure", b -> mod.sendGameModeChange(everyone, GameMode.ADVENTURE)),
+                    smallButton("Spec", "Spectator", b -> mod.sendGameModeChange(everyone, GameMode.SPECTATOR)));
         }
 
         private static CampfyreButton smallButton(String label, CampfyreButton.PressAction onPress) {
             return new CampfyreButton(0, 0, 48, 20, Text.literal(label), onPress);
+        }
+
+        // The row-packed buttons are too narrow (48px) to spell out full
+        // gamemode names without overlapping the row's own label - "Creat" in
+        // particular reads like a cut-off typo rather than a deliberate
+        // abbreviation. A hover tooltip spells the full name out without
+        // touching layout width at all.
+        private static CampfyreButton smallButton(String label, String fullName, CampfyreButton.PressAction onPress) {
+            CampfyreButton button = smallButton(label, onPress);
+            button.setTooltip(net.minecraft.client.gui.tooltip.Tooltip.of(Text.literal(fullName)));
+            return button;
         }
 
         // One row: a label on the left, and either a fixed set of action

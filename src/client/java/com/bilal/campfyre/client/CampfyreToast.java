@@ -27,8 +27,9 @@ import net.minecraft.client.toast.ToastManager;
 class CampfyreToast implements Toast {
 
     private static final long DISPLAY_MS = 6000;
-    private static final int WIDTH = 180;
-    private static final int HEIGHT = 32;
+    private static final int WIDTH = 200;
+    private static final int HEIGHT = 42;
+    private static final int MAX_DESCRIPTION_LINES = 2;
 
     // Kept as plain Strings: TextRenderer.trimToWidth(String, int) hands back
     // a String that DrawContext.drawTextWithShadow accepts directly, while
@@ -99,6 +100,49 @@ class CampfyreToast implements Toast {
         int textX = 7 + CampfyreUi.ICON_WIDTH + 6;
         int maxTextWidth = WIDTH - textX - 6;
         context.drawTextWithShadow(tr, tr.trimToWidth(title, maxTextWidth), textX, 6, CampfyreUi.TITLE_COLOR);
-        context.drawTextWithShadow(tr, tr.trimToWidth(description, maxTextWidth), textX, 18, CampfyreUi.TEXT_COLOR);
+
+        int lineY = 18;
+        for (String line : wrapDescription(tr, description, maxTextWidth)) {
+            context.drawTextWithShadow(tr, line, textX, lineY, CampfyreUi.TEXT_COLOR);
+            lineY += 10;
+        }
+    }
+
+    // Plain greedy word-wrap (stays in String-land like the rest of this
+    // class, see the field comment above) across up to
+    // MAX_DESCRIPTION_LINES lines instead of the single-line trimToWidth this
+    // used to do: most description strings (e.g. "Couldn't download the
+    // world - check your connection and try reconnecting") are well past the
+    // ~28 characters that fit on one line at this width, and a bare
+    // trimToWidth silently cut the actionable half off with no ellipsis - a
+    // non-technical player had no way to know text was missing. If it still
+    // doesn't fit in MAX_DESCRIPTION_LINES, the last line gets a trailing
+    // "..." so a cut reads as intentional instead of broken.
+    private static java.util.List<String> wrapDescription(TextRenderer tr, String text, int maxWidth) {
+        String[] words = text.split(" ");
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int consumedWords = 0;
+        for (String word : words) {
+            String candidate = current.isEmpty() ? word : current + " " + word;
+            if (tr.getWidth(candidate) <= maxWidth || current.isEmpty()) {
+                current = new StringBuilder(candidate);
+                consumedWords++;
+            } else if (lines.size() + 1 < MAX_DESCRIPTION_LINES) {
+                lines.add(current.toString());
+                current = new StringBuilder(word);
+                consumedWords++;
+            } else {
+                break; // last allowed line is full - remaining words are truncated below
+            }
+        }
+        lines.add(current.toString());
+
+        if (consumedWords < words.length) {
+            int lastIndex = lines.size() - 1;
+            int ellipsisWidth = tr.getWidth("...");
+            lines.set(lastIndex, tr.trimToWidth(lines.get(lastIndex), Math.max(0, maxWidth - ellipsisWidth)) + "...");
+        }
+        return lines;
     }
 }

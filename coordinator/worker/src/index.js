@@ -140,7 +140,14 @@ export default {
         // dropped here before), so its rate-limit check for a brand-new
         // group's first upload collapsed every caller worldwide into one
         // shared 'unknown' bucket instead of limiting per IP.
-        await forwardToGroup(env, groupId, request, '/save/incoming', { method: 'POST', headers: request.headers });
+        //
+        // This same call is also the authorization gate: /save/incoming now
+        // rejects an unauthorized/rate-limited caller itself (403/429)
+        // before this Worker ever touches the request body. Don't move the
+        // formData() parse above this check - that would let anyone force a
+        // near-100MB body parse on any group id, authorized or not.
+        const preflight = await forwardToGroup(env, groupId, request, '/save/incoming', { method: 'POST', headers: request.headers });
+        if (!preflight.ok) return preflight;
         let file;
         try {
           const form = await request.formData();
